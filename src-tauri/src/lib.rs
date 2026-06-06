@@ -8,11 +8,17 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+mod vault;
 mod workspace;
 
 #[derive(Default)]
 struct RequestState {
     cancellations: Mutex<HashMap<String, oneshot::Sender<()>>>,
+}
+
+#[derive(Default)]
+struct VaultState {
+    unlocked: Mutex<Option<(String, HashMap<String, String>)>>,
 }
 
 #[derive(Deserialize)]
@@ -286,6 +292,70 @@ fn save_workspace_environment(
 }
 
 #[tauri::command]
+fn save_workspace_settings(
+    app: tauri::AppHandle,
+    settings: workspace::WorkspaceSettings,
+) -> Result<(), String> {
+    workspace::save_settings(&app, &settings)
+}
+
+#[tauri::command]
+fn save_workspace_globals(
+    app: tauri::AppHandle,
+    variables: Vec<workspace::Variable>,
+) -> Result<(), String> {
+    workspace::save_globals(&app, &variables)
+}
+
+fn vault_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(workspace::workspace_root(app)?
+        .0
+        .join("private/secrets.enc"))
+}
+
+#[tauri::command]
+fn unlock_vault(
+    app: tauri::AppHandle,
+    password: String,
+    state: tauri::State<'_, VaultState>,
+) -> Result<HashMap<String, String>, String> {
+    let entries = vault::load(&vault_path(&app)?, &password)?;
+    *state
+        .unlocked
+        .lock()
+        .map_err(|_| "Could not unlock vault.".to_string())? = Some((password, entries.clone()));
+    Ok(entries)
+}
+
+#[tauri::command]
+fn save_vault(
+    app: tauri::AppHandle,
+    entries: HashMap<String, String>,
+    state: tauri::State<'_, VaultState>,
+) -> Result<(), String> {
+    let mut unlocked = state
+        .unlocked
+        .lock()
+        .map_err(|_| "Could not save vault.".to_string())?;
+    let password = unlocked
+        .as_ref()
+        .map(|value| value.0.clone())
+        .ok_or("Unlock the vault first.")?;
+    vault::save(&vault_path(&app)?, &password, &entries)?;
+    *unlocked = Some((password, entries));
+    Ok(())
+}
+
+#[tauri::command]
+fn lock_vault(state: tauri::State<'_, VaultState>) -> Result<(), String> {
+    *state
+        .unlocked
+        .lock()
+        .map_err(|_| "Could not lock vault.".to_string())? = None;
+    Ok(())
+}
+
+#[tauri::command]
 fn add_workspace_history(
     app: tauri::AppHandle,
     entry: workspace::HistoryEntry,
@@ -310,6 +380,7 @@ fn export_portable_workspace(app: tauri::AppHandle, path: String) -> Result<(), 
 pub fn run() {
     tauri::Builder::default()
         .manage(RequestState::default())
+        .manage(VaultState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -323,6 +394,11 @@ pub fn run() {
             save_workspace_collection,
             delete_workspace_collection,
             save_workspace_environment,
+            save_workspace_settings,
+            save_workspace_globals,
+            unlock_vault,
+            save_vault,
+            lock_vault,
             add_workspace_history,
             import_workspace_file,
             export_portable_workspace

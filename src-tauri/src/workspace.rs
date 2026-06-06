@@ -9,7 +9,8 @@ use std::{
 use tauri::{AppHandle, Manager};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
-const HISTORY_LIMIT: usize = 100;
+const DEFAULT_HISTORY_LIMIT: usize = 100;
+const DEFAULT_LOG_LIMIT_MB: usize = 10;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct KeyValueRow {
@@ -51,6 +52,8 @@ pub struct Collection {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub variables: Vec<Variable>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -90,6 +93,36 @@ pub struct WorkspaceSnapshot {
     pub requests: Vec<SavedRequest>,
     pub environments: Vec<Environment>,
     pub history: Vec<HistoryEntry>,
+    pub settings: WorkspaceSettings,
+    pub global_variables: Vec<Variable>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSettings {
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "default_log_limit_mb")]
+    pub log_limit_mb: usize,
+    #[serde(default = "enabled")]
+    pub autosave: bool,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            history_limit: default_history_limit(),
+            log_limit_mb: default_log_limit_mb(),
+            autosave: true,
+        }
+    }
+}
+
+fn default_history_limit() -> usize {
+    DEFAULT_HISTORY_LIMIT
+}
+fn default_log_limit_mb() -> usize {
+    DEFAULT_LOG_LIMIT_MB
 }
 
 #[derive(Serialize)]
@@ -133,19 +166,17 @@ fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{nanos}")
 }
 
-fn workspace_root(app: &AppHandle) -> Result<(PathBuf, bool), String> {
+pub(crate) fn workspace_root(app: &AppHandle) -> Result<(PathBuf, bool), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("Could not locate the application. ({error})"))?;
     let executable_dir = executable
         .parent()
         .ok_or_else(|| "Could not locate the application folder.".to_string())?;
     let portable_root = executable_dir
-        .parent()
-        .filter(|path| path.join("portable.flag").exists())
-        .unwrap_or(executable_dir);
-    let portable = executable_dir.join("portable.flag").exists()
-        || portable_root.join("portable.flag").exists();
-    let root = if portable {
+        .ancestors()
+        .take(8)
+        .find(|path| path.join("portable.flag").exists());
+    let root = if let Some(portable_root) = portable_root {
         portable_root.join("workspace")
     } else {
         app.path()
@@ -153,7 +184,7 @@ fn workspace_root(app: &AppHandle) -> Result<(PathBuf, bool), String> {
             .map_err(|error| format!("Could not locate local application data. ({error})"))?
             .join("workspace")
     };
-    Ok((root, portable))
+    Ok((root, portable_root.is_some()))
 }
 
 fn ensure_workspace(root: &Path) -> Result<(), String> {
@@ -182,6 +213,7 @@ fn ensure_workspace(root: &Path) -> Result<(), String> {
                 id: "default".into(),
                 name: "My requests".into(),
                 parent_id: None,
+                variables: vec![],
             },
         )?;
     }
@@ -225,7 +257,9 @@ pub fn load(app: &AppHandle) -> Result<WorkspaceSnapshot, String> {
     requests.sort_by(|a: &SavedRequest, b| a.name.cmp(&b.name));
     environments.sort_by(|a: &Environment, b| a.name.cmp(&b.name));
     history.sort_by(|a: &HistoryEntry, b| b.created_at.cmp(&a.created_at));
-    history.truncate(HISTORY_LIMIT);
+    let settings: WorkspaceSettings = read_json(&root.join("settings.json")).unwrap_or_default();
+    let global_variables: Vec<Variable> = read_json(&root.join("globals.json")).unwrap_or_default();
+    history.truncate(settings.history_limit);
     Ok(WorkspaceSnapshot {
         root: root.to_string_lossy().into_owned(),
         portable,
@@ -233,7 +267,27 @@ pub fn load(app: &AppHandle) -> Result<WorkspaceSnapshot, String> {
         requests,
         environments,
         history,
+        settings,
+        global_variables,
     })
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+pub fn save_settings(app: &AppHandle, settings: &WorkspaceSettings) -> Result<(), String> {
+    let (root, _) = workspace_root(app)?;
+    ensure_workspace(&root)?;
+    atomic_json(&root.join("settings.json"), settings)
+}
+
+pub fn save_globals(app: &AppHandle, variables: &[Variable]) -> Result<(), String> {
+    let (root, _) = workspace_root(app)?;
+    ensure_workspace(&root)?;
+    atomic_json(&root.join("globals.json"), variables)
 }
 
 pub fn save_request(app: &AppHandle, request: &SavedRequest) -> Result<(), String> {
@@ -265,6 +319,7 @@ pub fn create_collection(
         id: unique_id(&slug(name)),
         name: name.trim().to_string(),
         parent_id,
+        variables: vec![],
     };
     atomic_json(
         &root
@@ -346,6 +401,7 @@ pub fn add_history(app: &AppHandle, entry: &HistoryEntry) -> Result<(), String> 
         &root.join("history").join(format!("{}.json", entry.id)),
         entry,
     )?;
+    let settings: WorkspaceSettings = read_json(&root.join("settings.json")).unwrap_or_default();
     let mut files = fs::read_dir(root.join("history"))
         .into_iter()
         .flatten()
@@ -356,7 +412,7 @@ pub fn add_history(app: &AppHandle, entry: &HistoryEntry) -> Result<(), String> 
         })
         .collect::<Vec<_>>();
     files.sort_by_key(|(modified, _)| *modified);
-    let remove_count = files.len().saturating_sub(HISTORY_LIMIT);
+    let remove_count = files.len().saturating_sub(settings.history_limit);
     for (_, path) in files.into_iter().take(remove_count) {
         let _ = fs::remove_file(path);
     }
@@ -436,33 +492,111 @@ fn import_postman_items(items: &[Value], collection_id: &str, requests: &mut Vec
             .into_iter()
             .flatten()
             .map(|header| {
-                row(
+                let mut value = row(
                     header.get("key").and_then(Value::as_str).unwrap_or(""),
                     header.get("value").and_then(Value::as_str).unwrap_or(""),
-                )
+                );
+                value.enabled = !header
+                    .get("disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                value
             })
             .collect();
-        let body = request
-            .get("body")
+        let body_value = request.get("body");
+        let body = body_value
             .and_then(|body| body.get("raw"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        requests.push(imported_request(
-            collection_id,
-            name,
-            method,
-            url,
-            headers,
-            body,
-        ));
+        let mut imported = imported_request(collection_id, name, method, url, headers, body);
+        imported.params = request
+            .pointer("/url/query")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|parameter| {
+                let mut value = row(
+                    parameter.get("key").and_then(Value::as_str).unwrap_or(""),
+                    parameter.get("value").and_then(Value::as_str).unwrap_or(""),
+                );
+                value.enabled = !parameter
+                    .get("disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                value
+            })
+            .collect();
+        if let Some(mode) = body_value
+            .and_then(|body| body.get("mode"))
+            .and_then(Value::as_str)
+        {
+            imported.body_mode = match mode {
+                "urlencoded" => "form",
+                "formdata" => "multipart",
+                "file" => "binary",
+                _ => body_value
+                    .and_then(|body| body.pointer("/options/raw/language"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("text"),
+            }
+            .into();
+        }
+        imported.form_rows = body_value
+            .and_then(|body| body.get("urlencoded"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|field| {
+                row(
+                    field.get("key").and_then(Value::as_str).unwrap_or(""),
+                    field.get("value").and_then(Value::as_str).unwrap_or(""),
+                )
+            })
+            .collect();
+        imported.multipart_rows = body_value
+            .and_then(|body| body.get("formdata"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|field| {
+                let mut value = row(
+                    field.get("key").and_then(Value::as_str).unwrap_or(""),
+                    field
+                        .get("value")
+                        .or_else(|| field.get("src"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                value.kind = Some(
+                    if field.get("type").and_then(Value::as_str) == Some("file") {
+                        "file"
+                    } else {
+                        "text"
+                    }
+                    .into(),
+                );
+                value
+            })
+            .collect();
+        if let Some(auth) = request.get("auth") {
+            imported.auth_type = match auth.get("type").and_then(Value::as_str) {
+                Some("bearer") => "bearer",
+                Some("basic") => "basic",
+                Some("apikey") => "api-key",
+                _ => "none",
+            }
+            .into();
+        }
+        requests.push(imported);
     }
 }
 
 pub fn import_file(app: &AppHandle, path: &str) -> Result<ImportResult, String> {
     let bytes = fs::read(path).map_err(|error| format!("Could not read import file. ({error})"))?;
     let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Import files must be JSON. ({error})"))?;
+        .or_else(|_| serde_yaml::from_slice::<Value>(&bytes))
+        .map_err(|error| format!("Import files must be JSON or YAML. ({error})"))?;
     let (root, _) = workspace_root(app)?;
     ensure_workspace(&root)?;
 
@@ -515,6 +649,10 @@ pub fn import_file(app: &AppHandle, path: &str) -> Result<ImportResult, String> 
     if let Some(items) = value.get("item").and_then(Value::as_array) {
         import_postman_items(items, &collection.id, &mut requests);
     } else if let Some(paths) = value.get("paths").and_then(Value::as_object) {
+        let base_url = value
+            .pointer("/servers/0/url")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         for (path_name, methods) in paths {
             let Some(methods) = methods.as_object() else {
                 continue;
@@ -530,18 +668,39 @@ pub fn import_file(app: &AppHandle, path: &str) -> Result<ImportResult, String> 
                     .or_else(|| operation.get("operationId"))
                     .and_then(Value::as_str)
                     .unwrap_or(path_name);
-                requests.push(imported_request(
+                let parameters = operation
+                    .get("parameters")
+                    .and_then(Value::as_array)
+                    .or_else(|| methods.get("parameters").and_then(Value::as_array));
+                let mut headers = vec![];
+                let mut query = vec![];
+                for parameter in parameters.into_iter().flatten() {
+                    let name = parameter.get("name").and_then(Value::as_str).unwrap_or("");
+                    let sample = parameter
+                        .pointer("/example")
+                        .or_else(|| parameter.pointer("/schema/example"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    match parameter.get("in").and_then(Value::as_str) {
+                        Some("header") => headers.push(row(name, sample)),
+                        Some("query") => query.push(row(name, sample)),
+                        _ => {}
+                    }
+                }
+                let mut imported = imported_request(
                     &collection.id,
                     name,
                     &method.to_uppercase(),
-                    path_name,
-                    vec![],
+                    &format!("{base_url}{path_name}"),
+                    headers,
                     String::new(),
-                ));
+                );
+                imported.params = query;
+                requests.push(imported);
             }
         }
     } else {
-        return Err("This is not a supported Postman collection, Postman environment, or OpenAPI 3 JSON file.".into());
+        return Err("This is not a supported Postman collection, Postman environment, or OpenAPI 3 JSON/YAML file.".into());
     }
     for request in &requests {
         save_request(app, request)?;
@@ -703,16 +862,19 @@ mod tests {
                 id: "root".into(),
                 name: "Root".into(),
                 parent_id: None,
+                variables: vec![],
             },
             Collection {
                 id: "child".into(),
                 name: "Child".into(),
                 parent_id: Some("root".into()),
+                variables: vec![],
             },
             Collection {
                 id: "grandchild".into(),
                 name: "Grandchild".into(),
                 parent_id: Some("child".into()),
+                variables: vec![],
             },
         ];
         assert_eq!(

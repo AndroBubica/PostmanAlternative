@@ -10,7 +10,8 @@
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "portable:layout": "bash scripts/create-portable-layout.sh"
   },
   "packageManager": "pnpm@11.5.2",
   "dependencies": {

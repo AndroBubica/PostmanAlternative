@@ -258,6 +258,23 @@ Key interaction rules:
 - TLS verification is on by default. Disabling it shows a clear warning.
 - Dependencies and licenses are checked automatically in CI.
 
+## Phase 1 Implementation Status
+
+- [x] Portable Windows/macOS launchers and shared USB layout generator
+- [ ] Confirm and publish Windows x64 and universal macOS portable packages
+- [x] AES-256-GCM encrypted secret vault with Argon2 password derivation
+- [x] Multi-request tabs, autosave, and unsaved-exit warning
+- [x] Global, collection, environment, and temporary variables with source explanations
+- [x] cURL import/generation and URL variable highlighting
+- [x] JSON tree viewer and syntax highlighting
+- [x] OpenAPI JSON/YAML and Postman collection/environment imports
+- [ ] Preserve imported Postman folder hierarchy and complete authentication values
+- [x] Documented standalone workspace export format
+- [x] Configurable history limit and log-limit setting
+- [ ] Implement log retention and enforce the configured log-size limit
+- [x] Keyboard shortcuts, destructive-action undo, labels, and visible focus
+- [ ] Complete hands-on accessibility verification
+
 ## Open-Source Model
 
 Recommended license: **GPL-3.0-or-later**.
@@ -288,10 +305,11 @@ Validated on June 6, 2026:
 - [x] Send one HTTP request through the Rust core
 - [x] Display status, headers, and pretty JSON
 - [ ] Confirm Windows and macOS builds
-  - macOS Apple Silicon application bundle builds and launches successfully.
-  - Windows build has not yet been confirmed.
+  - macOS Apple Silicon application bundle and DMG build successfully.
+  - Windows x64 and universal macOS builds are configured in CI but have not yet been confirmed.
 - [ ] Prove portable-mode storage beside the executable
-  - No `portable.flag` detection or portable storage implementation exists yet.
+  - `portable.flag` ancestor detection and the shared workspace layout are implemented.
+  - Physical USB testing on Windows and macOS is still required.
 
 Validation commands passed:
 
@@ -312,24 +330,29 @@ Validation commands passed:
   - [x] Pretty/raw response body, response search, copy, headers, and metadata
   - [x] Multipart and binary request bodies
   - [x] Response preview, cookies, and save to file
-- Collections, folders, history, variables, environments
-- Plain-text workspace format
-- cURL and Postman import
-- Portable Windows and macOS release packages
+- [x] Collections, folders, history, variables, environments
+- [x] Plain-text workspace format
+- [x] cURL and Postman import
+- [ ] Published portable Windows and macOS release packages
 
 #### Remaining Phase 1 Work
 
-- [ ] Actual portable Windows/macOS release packages, launchers, and shared USB folder layout
-- [ ] Encrypted secret vault
+- [ ] Build, test, and publish actual Windows x64 and universal macOS portable packages
+- [x] Portable launchers and shared USB folder layout generator
+- [x] Encrypted secret vault
 - [x] Nested collection folders, rename, duplicate, move, delete, and favorites
-- [ ] Real multi-request tabs and autosave
-- [ ] Global, collection, and temporary variable scopes with source-hover explanations
-- [ ] cURL generation and URL variable highlighting
-- [ ] JSON tree viewer and syntax highlighting
-- [ ] Broader imports: OpenAPI YAML and fuller Postman auth/folder/body support
-- [ ] Documented standalone workspace export format
-- [ ] Configurable history/log limits and pending-write exit warning
-- [ ] Keyboard shortcuts, destructive-action undo, and fuller accessibility verification
+- [x] Real multi-request tabs and autosave
+- [x] Global, collection, and temporary variable scopes with source explanations
+- [x] cURL generation and URL variable highlighting
+- [x] JSON tree viewer and syntax highlighting
+- [ ] Preserve Postman folder hierarchy and import complete authentication values
+- [x] OpenAPI JSON/YAML and broader Postman body/query/header import
+- [x] Documented standalone workspace export format
+- [ ] Implement log files and enforce the configured log-size limit
+- [x] Configurable history limit and pending-write exit warning
+- [x] Keyboard shortcuts and destructive-action undo
+- [ ] Complete hands-on keyboard, screen-reader, and contrast accessibility verification
+- [ ] Test portable mode on physical Windows and macOS machines/USB media
 
 ### Phase 2: Testing
 

@@ -10,6 +10,9 @@
 body { margin: 0; min-width: 900px; min-height: 100vh; overflow: hidden; }
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible {
+  outline: 2px solid #f2b84b; outline-offset: 2px;
+}
 
 .app-shell {
   display: grid;
@@ -104,6 +107,7 @@ button { cursor: pointer; }
   min-width: 0; padding: 6px; border: 1px solid #303840; border-radius: 4px; color: #cbd3da; background: #101316; font-size: 10px;
 }
 .variable-row button { grid-column: 2 / -1; justify-self: end; padding: 2px 5px; }
+.scope-select { width: 100%; padding: 7px; color: #cbd3da; border: 1px solid #303840; border-radius: 4px; background: #101316; }
 .add-variable { margin-top: 5px; }
 .request-item span, .open-tab > span:first-child {
   min-width: 34px; font-size: 9px; font-weight: 900; letter-spacing: .02em;
@@ -124,6 +128,8 @@ button { cursor: pointer; }
   border: 0; border-right: 1px solid #2a3036; color: #9aa5ae; background: #171c20; font-size: 11px;
 }
 .open-tab { display: flex; align-items: center; gap: 8px; min-width: 190px; padding: 0 12px; }
+.tab-close { margin-left: auto; padding: 2px 4px; border-radius: 3px; }
+.tab-close:hover { color: #fff; background: #493035; }
 .open-tab.active { color: #eef2f5; border-top: 2px solid #e0aa48; background: #1b2025; }
 .unsaved-dot { width: 5px; height: 5px; margin-left: auto; border-radius: 50%; background: #e0aa48; }
 .tab-add { width: 38px; font-size: 18px; }
@@ -136,6 +142,14 @@ button { cursor: pointer; }
   flex: 1; min-width: 0; padding: 10px 12px; color: #e7edf2;
   border: 1px solid #343c44; border-radius: 6px; outline: none; background: #171c20;
 }
+.url-field { position: relative; display: flex; flex: 1; min-width: 180px; align-self: stretch; }
+.url-field > input { width: 100%; }
+.url-variables {
+  position: absolute; z-index: 3; top: calc(100% + 3px); left: 0; display: flex; max-width: 100%; gap: 5px;
+  padding: 4px; overflow: auto; border: 1px solid #3e4a53; border-radius: 4px; background: #171c20;
+}
+.url-variables span { padding: 2px 4px; color: #84d1b0; background: #173127; font-size: 9px; white-space: nowrap; }
+.url-variables span.unresolved { color: #e39a9f; background: #392124; }
 .send-button, .cancel-button {
   min-width: 92px; border: 1px solid #d59f3f; border-radius: 6px; color: #17130c;
   background: #e4ae4d; font-weight: 800;
@@ -230,6 +244,20 @@ textarea {
   margin: 0; padding: 14px 18px; color: #b8d7c7; white-space: pre-wrap;
   font: 12px/1.65 "SFMono-Regular", Consolas, monospace;
 }
+.json-key { color: #7eb7ef; }
+.json-string { color: #b8d7c7; }
+.json-number { color: #e9bc72; }
+.json-boolean { color: #c99aeb; }
+.json-null { color: #89949e; }
+.json-tree { padding: 12px 18px; color: #9faab3; font: 12px/1.8 "SFMono-Regular", Consolas, monospace; }
+.json-tree details { margin-left: 16px; }
+.json-tree summary { cursor: pointer; color: #7eb7ef; }
+.json-leaf { margin-left: 34px; }
+.undo-toast {
+  position: fixed; z-index: 20; right: 18px; bottom: 18px; display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; border: 1px solid #5b4930; border-radius: 7px; color: #e8edf2; background: #252018; box-shadow: 0 8px 30px #0008; font-size: 11px;
+}
+.undo-toast button { padding: 4px 7px; border: 1px solid #765d36; border-radius: 4px; color: #efc36e; background: #302719; }
 .response-headers { padding: 9px 18px; }
 .response-headers div { display: grid; grid-template-columns: 220px 1fr; padding: 6px 0; color: #9eabb5; font-size: 11px; }
 .response-headers strong { color: #cbd4db; }
