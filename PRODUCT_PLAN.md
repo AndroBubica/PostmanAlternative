@@ -340,7 +340,8 @@ Validation commands passed:
 - [ ] Build, test, and publish actual Windows x64 and universal macOS portable packages
 - [x] Portable launchers and shared USB folder layout generator
 - [x] Encrypted secret vault
-- [x] Nested collection folders, rename, duplicate, move, delete, and favorites
+- [x] Nested collection folders, rename, duplicate, request move, delete, and favorites
+- [ ] Move collection folders between parents
 - [x] Real multi-request tabs and autosave
 - [x] Global, collection, and temporary variable scopes with source explanations
 - [x] cURL generation and URL variable highlighting
