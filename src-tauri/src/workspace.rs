@@ -45,9 +45,12 @@ pub struct SavedRequest {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Collection {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -178,6 +181,7 @@ fn ensure_workspace(root: &Path) -> Result<(), String> {
             &Collection {
                 id: "default".into(),
                 name: "My requests".into(),
+                parent_id: None,
             },
         )?;
     }
@@ -250,12 +254,17 @@ pub fn delete_request(app: &AppHandle, request_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn create_collection(app: &AppHandle, name: &str) -> Result<Collection, String> {
+pub fn create_collection(
+    app: &AppHandle,
+    name: &str,
+    parent_id: Option<String>,
+) -> Result<Collection, String> {
     let (root, _) = workspace_root(app)?;
     ensure_workspace(&root)?;
     let collection = Collection {
         id: unique_id(&slug(name)),
         name: name.trim().to_string(),
+        parent_id,
     };
     atomic_json(
         &root
@@ -264,6 +273,59 @@ pub fn create_collection(app: &AppHandle, name: &str) -> Result<Collection, Stri
         &collection,
     )?;
     Ok(collection)
+}
+
+pub fn save_collection(app: &AppHandle, collection: &Collection) -> Result<(), String> {
+    let (root, _) = workspace_root(app)?;
+    ensure_workspace(&root)?;
+    atomic_json(
+        &root
+            .join("collections")
+            .join(format!("{}.json", collection.id)),
+        collection,
+    )
+}
+
+fn collection_descendant_ids(collections: &[Collection], collection_id: &str) -> Vec<String> {
+    let mut ids = vec![collection_id.to_string()];
+    let mut index = 0;
+    while index < ids.len() {
+        let parent_id = ids[index].clone();
+        for collection in collections {
+            if collection.parent_id.as_deref() == Some(&parent_id) && !ids.contains(&collection.id)
+            {
+                ids.push(collection.id.clone());
+            }
+        }
+        index += 1;
+    }
+    ids
+}
+
+pub fn delete_collection(app: &AppHandle, collection_id: &str) -> Result<(), String> {
+    if collection_id == "default" {
+        return Err("The default collection cannot be deleted.".into());
+    }
+    let (root, _) = workspace_root(app)?;
+    ensure_workspace(&root)?;
+    let collections: Vec<Collection> = read_json_files(&root.join("collections"));
+    let delete_ids = collection_descendant_ids(&collections, collection_id);
+    let requests: Vec<SavedRequest> = read_json_files(&root.join("requests"));
+    for request in requests {
+        if delete_ids.contains(&request.collection_id) {
+            let path = root.join("requests").join(format!("{}.json", request.id));
+            fs::remove_file(path)
+                .map_err(|error| format!("Could not delete request. ({error})"))?;
+        }
+    }
+    for id in delete_ids {
+        let path = root.join("collections").join(format!("{id}.json"));
+        if path.exists() {
+            fs::remove_file(path)
+                .map_err(|error| format!("Could not delete collection folder. ({error})"))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn save_environment(app: &AppHandle, environment: &Environment) -> Result<(), String> {
@@ -448,7 +510,7 @@ pub fn import_file(app: &AppHandle, path: &str) -> Result<ImportResult, String> 
         .or_else(|| value.get("title"))
         .and_then(Value::as_str)
         .unwrap_or("Imported API");
-    let collection = create_collection(app, collection_name)?;
+    let collection = create_collection(app, collection_name, None)?;
     let mut requests = vec![];
     if let Some(items) = value.get("item").and_then(Value::as_array) {
         import_postman_items(items, &collection.id, &mut requests);
@@ -625,5 +687,37 @@ mod tests {
         .unwrap();
         let exported: Environment = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(exported.variables[0].value, "");
+    }
+
+    #[test]
+    fn collection_parent_is_optional_for_existing_workspace_files() {
+        let collection: Collection =
+            serde_json::from_value(json!({"id": "users", "name": "Users"})).unwrap();
+        assert_eq!(collection.parent_id, None);
+    }
+
+    #[test]
+    fn collection_descendants_include_nested_folders() {
+        let collections = vec![
+            Collection {
+                id: "root".into(),
+                name: "Root".into(),
+                parent_id: None,
+            },
+            Collection {
+                id: "child".into(),
+                name: "Child".into(),
+                parent_id: Some("root".into()),
+            },
+            Collection {
+                id: "grandchild".into(),
+                name: "Grandchild".into(),
+                parent_id: Some("child".into()),
+            },
+        ];
+        assert_eq!(
+            collection_descendant_ids(&collections, "root"),
+            vec!["root", "child", "grandchild"]
+        );
     }
 }

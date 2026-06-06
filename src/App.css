@@ -73,9 +73,19 @@ button { cursor: pointer; }
   letter-spacing: .13em; text-transform: uppercase;
 }
 .collection { margin-bottom: 13px; }
-.collection h2 { margin: 0 5px 5px; color: #bdc5cc; font-size: 12px; font-weight: 650; }
+.favorites { padding-bottom: 8px; border-bottom: 1px solid #293037; }
+.favorites h2 { color: #efc36e; }
+.collection-heading { display: flex; align-items: center; justify-content: space-between; }
+.collection h2 { min-width: 0; margin: 0 5px 5px; overflow: hidden; color: #bdc5cc; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.collection-actions, .request-actions { display: flex; opacity: 0; }
+.collection:hover > .collection-heading .collection-actions, .request-item-row:hover .request-actions, .request-actions:focus-within, .collection-actions:focus-within { opacity: 1; }
+.collection-actions button, .request-actions button {
+  width: 22px; padding: 2px; border: 0; color: #89949e; background: transparent; font-size: 11px;
+}
+.collection-actions button:hover, .request-actions button:hover { color: #efc36e; }
+.request-item-row { display: flex; align-items: center; }
 .request-item {
-  display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 8px;
+  display: flex; min-width: 0; flex: 1; align-items: center; gap: 8px; padding: 7px 8px;
   border: 0; border-radius: 5px; color: #aab4bd; background: transparent; text-align: left; font-size: 12px;
 }
 .request-item:hover { color: #eef2f5; background: #20262c; }
@@ -133,6 +143,10 @@ button { cursor: pointer; }
 .save-button {
   align-self: stretch; padding: 0 12px; border: 1px solid #4a545d; border-radius: 6px; color: #cbd3da; background: #20262c; font-weight: 700;
 }
+.favorite-button {
+  align-self: stretch; width: 34px; border: 1px solid #4a545d; border-radius: 6px; color: #89949e; background: #20262c;
+}
+.favorite-button.active { color: #efc36e; }
 .send-button:hover { background: #efbd61; }
 .send-button:disabled { opacity: .65; cursor: wait; }
 .cancel-button { border-color: #75474b; color: #e1a4a8; background: #382124; }

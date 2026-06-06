@@ -6,8 +6,8 @@ subscriptions, cloud dependency, or telemetry.
 The current codebase is a Phase 1 MVP, built with Tauri 2, React, TypeScript,
 Rust, and Oxlint. It includes the everyday request workflow, atomic local
 workspace persistence, collections, environments and variable resolution,
-request history, Postman/OpenAPI/cURL imports, and secret-free portable
-workspace ZIP exports.
+request history, nested collection folders and organization actions,
+Postman/OpenAPI/cURL imports, and secret-free portable workspace ZIP exports.
 
 Workspace data is stored in the operating system's local application-data
 folder. When `portable.flag` exists beside the application, all workspace data

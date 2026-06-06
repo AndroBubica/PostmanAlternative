@@ -259,8 +259,22 @@ fn delete_workspace_request(app: tauri::AppHandle, request_id: String) -> Result
 fn create_workspace_collection(
     app: tauri::AppHandle,
     name: String,
+    parent_id: Option<String>,
 ) -> Result<workspace::Collection, String> {
-    workspace::create_collection(&app, &name)
+    workspace::create_collection(&app, &name, parent_id)
+}
+
+#[tauri::command]
+fn save_workspace_collection(
+    app: tauri::AppHandle,
+    collection: workspace::Collection,
+) -> Result<(), String> {
+    workspace::save_collection(&app, &collection)
+}
+
+#[tauri::command]
+fn delete_workspace_collection(app: tauri::AppHandle, collection_id: String) -> Result<(), String> {
+    workspace::delete_collection(&app, &collection_id)
 }
 
 #[tauri::command]
@@ -306,6 +320,8 @@ pub fn run() {
             save_workspace_request,
             delete_workspace_request,
             create_workspace_collection,
+            save_workspace_collection,
+            delete_workspace_collection,
             save_workspace_environment,
             add_workspace_history,
             import_workspace_file,

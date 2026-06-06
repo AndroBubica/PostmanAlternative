@@ -25,7 +25,7 @@ type AuthType = "none" | "basic" | "bearer" | "api-key";
 type BodyMode = "json" | "text" | "xml" | "form" | "multipart" | "binary";
 type ResponseView = "pretty" | "raw" | "preview";
 type MultipartRow = KeyValueRow & { kind: "text" | "file" };
-type Collection = { id: string; name: string };
+type Collection = { id: string; name: string; parentId?: string };
 type Variable = { name: string; value: string; secret: boolean; enabled: boolean };
 type Environment = { id: string; name: string; variables: Variable[] };
 type HistoryEntry = {
@@ -215,6 +215,7 @@ function App() {
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
   const [saved, setSaved] = useState(true);
+  const [favorite, setFavorite] = useState(false);
   const activeRequestId = useRef("");
 
   async function refreshWorkspace() {
@@ -383,7 +384,7 @@ function App() {
       authFields,
       timeoutMs,
       followRedirects,
-      favorite: false,
+      favorite,
     };
   }
 
@@ -414,6 +415,7 @@ function App() {
     setAuthFields({ username: "", password: "", token: "", key: "", value: "", location: "header", ...request.authFields });
     setTimeoutMs(request.timeoutMs);
     setFollowRedirects(request.followRedirects);
+    setFavorite(request.favorite);
     setResponse(null);
     setError("");
     setSaved(true);
@@ -428,15 +430,80 @@ function App() {
     setHeaders([{ id: 1, name: "Accept", value: "application/json", enabled: true }]);
     setBody("");
     setResponse(null);
+    setFavorite(false);
     setSaved(false);
   }
 
-  async function createCollection() {
-    const name = window.prompt("Collection name");
+  async function createCollection(parentId?: string) {
+    const name = window.prompt(parentId ? "Folder name" : "Collection name");
     if (!name?.trim()) return;
-    const collection = await invoke<Collection>("create_workspace_collection", { name });
+    const collection = await invoke<Collection>("create_workspace_collection", { name, parentId });
     setCollectionId(collection.id);
     await refreshWorkspace();
+  }
+
+  async function renameCollection(collection: Collection) {
+    const name = window.prompt("Rename collection folder", collection.name);
+    if (!name?.trim() || name.trim() === collection.name) return;
+    await invoke("save_workspace_collection", { collection: { ...collection, name: name.trim() } });
+    await refreshWorkspace();
+  }
+
+  async function deleteCollection(collection: Collection) {
+    if (!window.confirm(`Delete "${collection.name}" and every request and folder inside it?`)) return;
+    await invoke("delete_workspace_collection", { collectionId: collection.id });
+    if (collectionId === collection.id) setCollectionId("default");
+    setNotice(`Deleted "${collection.name}".`);
+    await refreshWorkspace();
+  }
+
+  async function duplicateRequest(request: SavedRequest) {
+    const duplicate = { ...request, id: crypto.randomUUID(), name: `${request.name} copy` };
+    await invoke("save_workspace_request", { request: duplicate });
+    setNotice(`Duplicated "${request.name}".`);
+    await refreshWorkspace();
+  }
+
+  async function deleteRequest(request: SavedRequest) {
+    if (!window.confirm(`Delete "${request.name}"?`)) return;
+    await invoke("delete_workspace_request", { requestId: request.id });
+    if (requestId === request.id) newRequest();
+    setNotice(`Deleted "${request.name}".`);
+    await refreshWorkspace();
+  }
+
+  async function toggleFavorite(request: SavedRequest) {
+    await invoke("save_workspace_request", { request: { ...request, favorite: !request.favorite } });
+    if (requestId === request.id) setFavorite(!request.favorite);
+    await refreshWorkspace();
+  }
+
+  function renderCollection(collection: Collection, depth = 0): React.ReactNode {
+    const requests = visibleRequests.filter((request) => request.collectionId === collection.id);
+    const children = workspace?.collections.filter((item) => item.parentId === collection.id) ?? [];
+    return (
+      <section className="collection" key={collection.id} style={{ marginLeft: `${depth * 10}px` }}>
+        <div className="collection-heading">
+          <h2><span>⌄</span> {collection.name}</h2>
+          <div className="collection-actions">
+            <button type="button" title="New nested folder" aria-label={`New folder in ${collection.name}`} onClick={() => createCollection(collection.id)}>+</button>
+            <button type="button" title="Rename" aria-label={`Rename ${collection.name}`} onClick={() => renameCollection(collection)}>✎</button>
+            {collection.id !== "default" && <button type="button" title="Delete" aria-label={`Delete ${collection.name}`} onClick={() => deleteCollection(collection)}>×</button>}
+          </div>
+        </div>
+        {requests.map((request) => (
+          <div className="request-item-row" key={request.id}>
+            <button className="request-item" onClick={() => loadRequest(request)} type="button"><span className={methodColors[request.method]}>{request.method}</span>{request.name}</button>
+            <div className="request-actions">
+              <button type="button" title={request.favorite ? "Remove favorite" : "Add favorite"} aria-label={request.favorite ? `Remove ${request.name} from favorites` : `Add ${request.name} to favorites`} onClick={() => toggleFavorite(request)}>{request.favorite ? "★" : "☆"}</button>
+              <button type="button" title="Duplicate" aria-label={`Duplicate ${request.name}`} onClick={() => duplicateRequest(request)}>⧉</button>
+              <button type="button" title="Delete" aria-label={`Delete ${request.name}`} onClick={() => deleteRequest(request)}>×</button>
+            </div>
+          </div>
+        ))}
+        {children.map((child) => renderCollection(child, depth + 1))}
+      </section>
+    );
   }
 
   async function importFile() {
@@ -533,16 +600,15 @@ function App() {
       </header>
 
       <aside className="sidebar">
-        <div className="sidebar-actions"><button className="new-button" onClick={newRequest} type="button">+ New request</button><button className="icon-button" onClick={createCollection} type="button" aria-label="New collection">+</button></div>
+        <div className="sidebar-actions"><button className="new-button" onClick={newRequest} type="button">+ New request</button><button className="icon-button" onClick={() => createCollection()} type="button" aria-label="New collection">+</button></div>
         <div className="sidebar-switcher"><button className={sidebarView === "collections" ? "active" : ""} onClick={() => setSidebarView("collections")} type="button">Collections</button><button className={sidebarView === "history" ? "active" : ""} onClick={() => setSidebarView("history")} type="button">History</button></div>
         {sidebarView === "collections" && <><input className="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search requests..." aria-label="Search requests" />
         <nav aria-label="Collections">
-          {workspace?.collections.map((collection) => (
-            <section className="collection" key={collection.id}>
-              <h2><span>⌄</span> {collection.name}</h2>
-              {visibleRequests.filter((request) => request.collectionId === collection.id).map((request) => <button className="request-item" key={request.id} onClick={() => loadRequest(request)} type="button"><span className={methodColors[request.method]}>{request.method}</span>{request.name}</button>)}
-            </section>
-          ))}
+          {visibleRequests.some((request) => request.favorite) && <section className="collection favorites">
+            <h2>★ Favorites</h2>
+            {visibleRequests.filter((request) => request.favorite).map((request) => <button className="request-item" key={request.id} onClick={() => loadRequest(request)} type="button"><span className={methodColors[request.method]}>{request.method}</span>{request.name}</button>)}
+          </section>}
+          {workspace?.collections.filter((collection) => !collection.parentId).map((collection) => renderCollection(collection))}
         </nav></>}
         {sidebarView === "history" && <nav aria-label="Request history"><p className="section-label">Recent requests</p>{workspace?.history.map((entry) => <button className="history-item" key={entry.id} onClick={() => { setMethod(entry.method); setUrl(entry.url); setRequestName(entry.name); }} type="button"><span className={methodColors[entry.method]}>{entry.method}</span><strong>{entry.name}</strong><small>{entry.status ?? "Failed"} · {new Date(entry.created_at).toLocaleString()}</small></button>)}</nav>}
         {sidebarView === "environment" && <div className="environment-editor"><div className="environment-heading"><strong>Variables</strong><button onClick={addEnvironment} type="button">+ Environment</button></div>{activeEnvironment ? <><p>{activeEnvironment.name}</p>{activeEnvironment.variables.map((variable, index) => <div className="variable-row" key={`${variable.name}-${index}`}><input aria-label="Enable variable" checked={variable.enabled} onChange={(event) => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, enabled: event.target.checked } : item) })} type="checkbox" /><input value={variable.name} onChange={(event) => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) })} placeholder="Name" /><input type={variable.secret ? "password" : "text"} value={variable.value} onChange={(event) => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, value: event.target.value } : item) })} placeholder="Value" /><button title="Toggle secret" onClick={() => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, secret: !item.secret } : item) })} type="button">{variable.secret ? "Masked" : "Plain"}</button></div>)}<button className="add-variable" onClick={() => updateEnvironment({ ...activeEnvironment, variables: [...activeEnvironment.variables, { name: "", value: "", secret: false, enabled: true }] })} type="button">+ Add variable</button></> : <div className="empty-state">Choose or create an environment.</div>}</div>}
@@ -556,6 +622,7 @@ function App() {
           <div className="request-line">
             <input className="request-name" value={requestName} onChange={(event) => { setRequestName(event.target.value); setSaved(false); }} aria-label="Request name" />
             <select className="collection-select" value={collectionId} onChange={(event) => { setCollectionId(event.target.value); setSaved(false); }} aria-label="Collection">{workspace?.collections.map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}</select>
+            <button className={`favorite-button ${favorite ? "active" : ""}`} onClick={() => { setFavorite((current) => !current); setSaved(false); }} type="button" aria-label={favorite ? "Remove from favorites" : "Add to favorites"}>{favorite ? "★" : "☆"}</button>
             <select value={method} onChange={(event) => setMethod(event.target.value)} aria-label="HTTP method">{["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].map((item) => <option key={item}>{item}</option>)}</select>
             <input value={url} onChange={(event) => setUrl(event.target.value)} aria-label="Request URL" />
             <button className="save-button" onClick={saveRequest} type="button">Save</button>

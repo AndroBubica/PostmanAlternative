@@ -317,6 +317,20 @@ Validation commands passed:
 - cURL and Postman import
 - Portable Windows and macOS release packages
 
+#### Remaining Phase 1 Work
+
+- [ ] Actual portable Windows/macOS release packages, launchers, and shared USB folder layout
+- [ ] Encrypted secret vault
+- [x] Nested collection folders, rename, duplicate, move, delete, and favorites
+- [ ] Real multi-request tabs and autosave
+- [ ] Global, collection, and temporary variable scopes with source-hover explanations
+- [ ] cURL generation and URL variable highlighting
+- [ ] JSON tree viewer and syntax highlighting
+- [ ] Broader imports: OpenAPI YAML and fuller Postman auth/folder/body support
+- [ ] Documented standalone workspace export format
+- [ ] Configurable history/log limits and pending-write exit warning
+- [ ] Keyboard shortcuts, destructive-action undo, and fuller accessibility verification
+
 ### Phase 2: Testing
 
 - Script sandbox
