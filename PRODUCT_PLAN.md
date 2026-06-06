@@ -381,12 +381,14 @@ remain open until the physical platform/device matrix is actually completed.
 
 ### Phase 2: Testing
 
-**Status: Feature complete**
+**Status: Feature implementation complete; interface stabilization in progress**
 
 - [x] Sandboxed pre-request and post-response JavaScript with explicit per-request enablement
 - [x] Friendly assertions for status, headers, JSON paths, body content, and timing
 - [x] Nested collection runner with pass/fail results
 - [x] Workspace CLI runner with JSON and JUnit reports
+- [ ] Complete the interface stabilization and verification work in
+  `INTERFACE_COMPLETION_PLAN.md`
 
 ### Phase 3: Protocols and polish
 
