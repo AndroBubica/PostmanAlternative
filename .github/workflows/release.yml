@@ -50,7 +50,12 @@ jobs:
           Copy-Item "packaging/Start-Windows.cmd", "packaging/Start-macOS.command" $root
           Copy-Item "packaging/PORTABLE-README.txt" "$root/README.txt"
           tar.exe -a -c -f "${{ matrix.archive }}" -C release API-Lantern
-          (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.archive }}" | Set-Content "${{ matrix.archive }}.sha256"
+          $hash = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText(
+            "${{ matrix.archive }}.sha256",
+            "$hash  ${{ matrix.archive }}`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
       - name: Verify Windows portable package
         if: runner.os == 'Windows'
         shell: pwsh
@@ -71,6 +76,8 @@ jobs:
           $expected = (Get-Content "${{ matrix.archive }}.sha256").Split()[0]
           $actual = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $expected) { throw "Portable package checksum mismatch." }
+          $checksumBytes = [System.IO.File]::ReadAllBytes("${{ matrix.archive }}.sha256")
+          if ($checksumBytes -contains 13) { throw "Checksum file must use portable LF line endings." }
           $process = Start-Process -FilePath "$root/Windows-x64/api-lantern.exe" -PassThru
           Start-Sleep -Seconds 5
           if (-not $process.HasExited) { Stop-Process -Id $process.Id }
