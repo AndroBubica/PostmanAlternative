@@ -101,12 +101,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .history-item small { grid-column: 2; color: #929ca5; }
 .environment-editor { min-height: 0; overflow: auto; }
 .environment-heading { display: flex; align-items: center; justify-content: space-between; margin: 12px 3px; color: #cbd3da; font-size: 11px; }
+.environment-heading > div { display: flex; gap: 4px; }
 .environment-editor > p { color: #89949e; font-size: 11px; }
 .variable-row { display: grid; grid-template-columns: 20px 1fr 1fr; gap: 4px; margin-bottom: 5px; }
 .variable-row input:not([type="checkbox"]) {
   min-width: 0; padding: 6px; border: 1px solid #303840; border-radius: 4px; color: #cbd3da; background: #101316; font-size: 10px;
 }
-.variable-row button { grid-column: 2 / -1; justify-self: end; padding: 2px 5px; }
+.variable-actions { grid-column: 2 / -1; display: flex; justify-content: flex-end; gap: 4px; }
+.variable-row button { padding: 2px 5px; }
 .scope-select { width: 100%; padding: 7px; color: #cbd3da; border: 1px solid #303840; border-radius: 4px; background: #101316; }
 .add-variable { margin-top: 5px; }
 .request-item span, .tab-select > span:first-child {

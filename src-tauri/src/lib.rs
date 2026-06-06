@@ -309,6 +309,14 @@ fn save_workspace_environment(
 }
 
 #[tauri::command]
+fn delete_workspace_environment(
+    app: tauri::AppHandle,
+    environment_id: String,
+) -> Result<(), String> {
+    workspace::delete_environment(&app, &environment_id)
+}
+
+#[tauri::command]
 fn save_workspace_settings(
     app: tauri::AppHandle,
     settings: workspace::WorkspaceSettings,
@@ -412,6 +420,7 @@ pub fn run() {
             save_workspace_collection,
             delete_workspace_collection,
             save_workspace_environment,
+            delete_workspace_environment,
             save_workspace_settings,
             save_workspace_globals,
             unlock_vault,

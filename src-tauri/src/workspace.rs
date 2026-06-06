@@ -448,6 +448,18 @@ pub fn save_environment(app: &AppHandle, environment: &Environment) -> Result<()
     )
 }
 
+pub fn delete_environment(app: &AppHandle, environment_id: &str) -> Result<(), String> {
+    let (root, _) = workspace_root(app)?;
+    let path = root
+        .join("environments")
+        .join(format!("{environment_id}.json"));
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Could not delete environment. ({error})"))?;
+    }
+    Ok(())
+}
+
 pub fn add_history(app: &AppHandle, entry: &HistoryEntry) -> Result<(), String> {
     let (root, _) = workspace_root(app)?;
     ensure_workspace(&root)?;

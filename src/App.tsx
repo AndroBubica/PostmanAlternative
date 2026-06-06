@@ -80,7 +80,18 @@ type WorkspaceSnapshot = {
   global_variables: Variable[];
 };
 
-type OpenTab = { key: string; request: SavedRequest; response: ApiResponse | null; error: string };
+type OpenTab = {
+  key: string;
+  request: SavedRequest;
+  response: ApiResponse | null;
+  error: string;
+  testResults: TestResult[];
+  responseTab: string;
+  responseView: ResponseView;
+  responseTree: boolean;
+  responseSearch: string;
+  saved: boolean;
+};
 type UndoAction = { message: string; run: () => Promise<void> };
 type TestResult = { name: string; passed: boolean; message: string };
 type RunItem = { request_id: string; name: string; method: string; url: string; status: number | null; elapsed_ms: number; tests: TestResult[]; error: string };
@@ -275,6 +286,13 @@ function App() {
   const [pendingWrites, setPendingWrites] = useState(0);
   const skipDirty = useRef(true);
   const activeRequestId = useRef("");
+  const workspaceWriteQueue = useRef<Promise<unknown>>(Promise.resolve());
+
+  function queueWorkspaceWrite<T>(write: () => Promise<T>) {
+    const queued = workspaceWriteQueue.current.then(write, write);
+    workspaceWriteQueue.current = queued.catch(() => undefined);
+    return queued;
+  }
 
   async function refreshWorkspace() {
     const loaded = await invoke<WorkspaceSnapshot>("load_workspace");
@@ -378,7 +396,8 @@ function App() {
   function buildRequest() {
     const requestUrl = new URL(resolveVariables(url));
     params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(resolveVariables(row.name), resolveVariables(row.value)));
-    const requestHeaders = headers.map((header) => ({ ...header, name: resolveVariables(header.name), value: resolveVariables(header.value) }));
+    const requestHeaders = headers.filter((header) => header.enabled).map((header) => ({ ...header, name: resolveVariables(header.name), value: resolveVariables(header.value) }));
+    const contentTypeDisabled = headers.some((header) => !header.enabled && header.name.toLowerCase() === "content-type");
     const contentTypes: Partial<Record<BodyMode, string>> = {
       json: "application/json",
       text: "text/plain",
@@ -392,16 +411,16 @@ function App() {
     } else {
       const value = contentTypes[bodyMode];
       if (value && contentType) contentType.value = value;
-      else if (value) requestHeaders.push({ id: -2, name: "Content-Type", value, enabled: true });
+      else if (value && !contentTypeDisabled) requestHeaders.push({ id: -2, name: "Content-Type", value, enabled: true });
     }
 
     if (authType === "basic") {
-      requestHeaders.push({ id: -1, name: "Authorization", value: `Basic ${btoa(`${authFields.username}:${authFields.password}`)}`, enabled: true });
+      requestHeaders.push({ id: -1, name: "Authorization", value: `Basic ${btoa(`${resolveVariables(authFields.username)}:${resolveVariables(authFields.password)}`)}`, enabled: true });
     } else if (authType === "bearer") {
-      requestHeaders.push({ id: -1, name: "Authorization", value: `Bearer ${authFields.token}`, enabled: true });
+      requestHeaders.push({ id: -1, name: "Authorization", value: `Bearer ${resolveVariables(authFields.token)}`, enabled: true });
     } else if (authType === "api-key" && authFields.key) {
-      if (authFields.location === "query") requestUrl.searchParams.append(authFields.key, authFields.value);
-      else requestHeaders.push({ id: -1, name: authFields.key, value: authFields.value, enabled: true });
+      if (authFields.location === "query") requestUrl.searchParams.append(resolveVariables(authFields.key), resolveVariables(authFields.value));
+      else requestHeaders.push({ id: -1, name: resolveVariables(authFields.key), value: resolveVariables(authFields.value), enabled: true });
     }
 
     const canHaveBody = !["GET", "HEAD"].includes(method);
@@ -418,7 +437,7 @@ function App() {
       headers: requestHeaders,
       body_kind: canHaveBody && (bodyMode === "multipart" || bodyMode === "binary") ? bodyMode : "text",
       body: requestBody,
-      multipart_fields: canHaveBody && bodyMode === "multipart" ? multipartRows : [],
+      multipart_fields: canHaveBody && bodyMode === "multipart" ? multipartRows.filter((row) => row.enabled).map((row) => ({ ...row, name: resolveVariables(row.name), value: resolveVariables(row.value) })) : [],
       binary_file: canHaveBody && bodyMode === "binary" && binaryFile ? binaryFile : null,
     };
   }
@@ -522,17 +541,19 @@ function App() {
     event.preventDefault();
     setSending(true);
     setError("");
-    const requestId = crypto.randomUUID();
-    activeRequestId.current = requestId;
+    const transportRequestId = crypto.randomUUID();
+    activeRequestId.current = transportRequestId;
     try {
       let built = buildRequest();
+      let scriptResults: TestResult[] = [];
       if (scriptsEnabled && preRequestScript.trim()) {
         const scripted = await runSandboxScript(preRequestScript, { request: built, response: null, variables: variableValues() });
         built = scripted.request as typeof built;
+        scriptResults = scripted.tests.map((test) => ({ ...test, name: `Pre-request: ${test.name}` }));
       }
       const result = await invoke<ApiResponse>("send_request", {
         request: {
-          id: requestId,
+          id: transportRequestId,
           method,
           ...built,
           timeout_ms: timeoutMs,
@@ -540,10 +561,14 @@ function App() {
         },
       });
       setResponse(result);
-      let results = assertionResults(assertions, result);
+      let results = [...scriptResults, ...assertionResults(assertions, result)];
       if (scriptsEnabled && postResponseScript.trim()) {
-        const scripted = await runSandboxScript(postResponseScript, { request: built, response: result, variables: variableValues() });
-        results = [...results, ...scripted.tests];
+        try {
+          const scripted = await runSandboxScript(postResponseScript, { request: built, response: result, variables: variableValues() });
+          results = [...results, ...scripted.tests];
+        } catch (scriptError) {
+          results = [...results, { name: "Post-response script", passed: false, message: String(scriptError) }];
+        }
       }
       setTestResults(results);
       setResponseTab("Body");
@@ -626,16 +651,21 @@ function App() {
     if (activeTabKey) captureActiveTab();
     const existing = openTabs.find((tab) => tab.request.id === request.id);
     if (existing) {
+      if (existing.key === activeTabKey) return;
       switchTab(existing);
       return;
     }
-    const tab = { key: crypto.randomUUID(), request, response: null, error: "" };
+    const tab: OpenTab = {
+      key: crypto.randomUUID(), request, response: null, error: "", testResults: [],
+      responseTab: "Body", responseView: "pretty", responseTree: false, responseSearch: "", saved: true,
+    };
     setOpenTabs((current) => [...current, tab]);
     setActiveTabKey(tab.key);
-    applyRequest(request, null, "");
+    applyRequest(tab);
   }
 
-  function applyRequest(request: SavedRequest, tabResponse: ApiResponse | null, tabError: string) {
+  function applyRequest(tab: OpenTab) {
+    const { request } = tab;
     skipDirty.current = true;
     setRequestId(request.id);
     setCollectionId(request.collectionId);
@@ -658,22 +688,28 @@ function App() {
     setPostResponseScript(request.postResponseScript ?? "");
     setScriptsEnabled(request.scriptsEnabled ?? false);
     setAssertions(request.assertions ?? []);
-    setTestResults([]);
-    setResponse(tabResponse);
-    setError(tabError);
-    setSaved(true);
+    setTestResults(tab.testResults);
+    setResponse(tab.response);
+    setError(tab.error);
+    setResponseTab(tab.responseTab);
+    setResponseView(tab.responseView);
+    setResponseTree(tab.responseTree);
+    setResponseSearch(tab.responseSearch);
+    setSaved(tab.saved);
   }
 
   function captureActiveTab() {
     if (!activeTabKey) return;
     const request = currentRequest();
-    setOpenTabs((current) => current.map((tab) => tab.key === activeTabKey ? { ...tab, request, response, error } : tab));
+    setOpenTabs((current) => current.map((tab) => tab.key === activeTabKey ? {
+      ...tab, request, response, error, testResults, responseTab, responseView, responseTree, responseSearch, saved,
+    } : tab));
   }
 
   function switchTab(tab: OpenTab) {
     captureActiveTab();
     setActiveTabKey(tab.key);
-    applyRequest(tab.request, tab.response, tab.error);
+    applyRequest(tab);
   }
 
   function newRequest() {
@@ -685,10 +721,13 @@ function App() {
       authType: "none", authFields: {}, timeoutMs: 30000, followRedirects: true, favorite: false,
       preRequestScript: "", postResponseScript: "", scriptsEnabled: false, assertions: [],
     };
-    const tab = { key: crypto.randomUUID(), request: blank, response: null, error: "" };
+    const tab: OpenTab = {
+      key: crypto.randomUUID(), request: blank, response: null, error: "", testResults: [],
+      responseTab: "Body", responseView: "pretty", responseTree: false, responseSearch: "", saved: false,
+    };
     setOpenTabs((current) => [...current, tab]);
     setActiveTabKey(tab.key);
-    applyRequest(blank, null, "");
+    applyRequest(tab);
     setRequestId("");
     setRequestName("Untitled request");
     setMethod("GET");
@@ -707,6 +746,9 @@ function App() {
   }
 
   function closeTab(key: string) {
+    const closing = openTabs.find((tab) => tab.key === key);
+    const closingSaved = key === activeTabKey ? saved : closing?.saved;
+    if (closingSaved === false && !window.confirm("Close this tab and discard its unsaved changes?")) return;
     const remaining = openTabs.filter((tab) => tab.key !== key);
     setOpenTabs(remaining);
     if (key === activeTabKey) {
@@ -773,13 +815,37 @@ function App() {
 
   async function deleteCollection(collection: Collection) {
     if (!window.confirm(`Delete "${collection.name}" and every request and folder inside it?`)) return;
+    const deletedCollections: Collection[] = [];
+    const deletedIds = new Set([collection.id]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      workspace?.collections.forEach((candidate) => {
+        if (deletedIds.has(candidate.id) || !candidate.parentId || !deletedIds.has(candidate.parentId)) return;
+        deletedIds.add(candidate.id);
+        changed = true;
+      });
+    }
+    workspace?.collections.forEach((candidate) => {
+      if (deletedIds.has(candidate.id)) deletedCollections.push(candidate);
+    });
+    const deletedRequests = workspace?.requests.filter((request) => deletedIds.has(request.collectionId)) ?? [];
     await invoke("delete_workspace_collection", { collectionId: collection.id });
     if (collectionId === collection.id) setCollectionId("default");
     setNotice(`Deleted "${collection.name}".`);
     setUndoAction({ message: `Restore "${collection.name}"`, run: async () => {
-      await invoke("save_workspace_collection", { collection });
-      const affected = workspace?.requests.filter((request) => request.collectionId === collection.id) ?? [];
-      await Promise.all(affected.map((request) => invoke("save_workspace_request", { request })));
+      const remaining = [...deletedCollections];
+      const restored = new Set<string>();
+      while (remaining.length) {
+        const ready = remaining.filter((item) => !item.parentId || !deletedIds.has(item.parentId) || restored.has(item.parentId));
+        if (!ready.length) throw new Error("Could not restore the deleted collection hierarchy.");
+        for (const item of ready) {
+          await invoke("save_workspace_collection", { collection: item });
+          restored.add(item.id);
+          remaining.splice(remaining.indexOf(item), 1);
+        }
+      }
+      await Promise.all(deletedRequests.map((request) => invoke("save_workspace_request", { request })));
       await refreshWorkspace();
     } });
     await refreshWorkspace();
@@ -796,6 +862,7 @@ function App() {
     if (!window.confirm(`Delete "${request.name}"?`)) return;
     await invoke("delete_workspace_request", { requestId: request.id });
     if (requestId === request.id) newRequest();
+    setOpenTabs((current) => current.filter((tab) => tab.request.id !== request.id));
     setNotice(`Deleted "${request.name}".`);
     setUndoAction({ message: `Restore "${request.name}"`, run: async () => {
       await invoke("save_workspace_request", { request });
@@ -818,14 +885,15 @@ function App() {
     });
     const requestUrl = new URL(resolve(request.url));
     request.params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(resolve(row.name), resolve(row.value)));
-    const requestHeaders = request.headers.map((header) => ({ ...header, name: resolve(header.name), value: resolve(header.value) }));
+    const requestHeaders = request.headers.filter((header) => header.enabled).map((header) => ({ ...header, name: resolve(header.name), value: resolve(header.value) }));
+    const contentTypeDisabled = request.headers.some((header) => !header.enabled && header.name.toLowerCase() === "content-type");
     const contentTypes: Partial<Record<BodyMode, string>> = { json: "application/json", text: "text/plain", xml: "application/xml", form: "application/x-www-form-urlencoded", binary: "application/octet-stream" };
     const contentType = requestHeaders.find((header) => header.name.toLowerCase() === "content-type");
     if (request.bodyMode === "multipart") {
       if (contentType) contentType.enabled = false;
     } else if (contentTypes[request.bodyMode]) {
       if (contentType) contentType.value = contentTypes[request.bodyMode]!;
-      else requestHeaders.push({ id: -2, name: "Content-Type", value: contentTypes[request.bodyMode]!, enabled: true });
+      else if (!contentTypeDisabled) requestHeaders.push({ id: -2, name: "Content-Type", value: contentTypes[request.bodyMode]!, enabled: true });
     }
     if (request.authType === "basic") requestHeaders.push({ id: -1, name: "Authorization", value: `Basic ${btoa(`${resolve(request.authFields.username ?? "")}:${resolve(request.authFields.password ?? "")}`)}`, enabled: true });
     if (request.authType === "bearer") requestHeaders.push({ id: -1, name: "Authorization", value: `Bearer ${resolve(request.authFields.token ?? "")}`, enabled: true });
@@ -841,7 +909,7 @@ function App() {
       url: requestUrl.toString(), headers: requestHeaders,
       body_kind: canHaveBody && ["multipart", "binary"].includes(request.bodyMode) ? request.bodyMode : "text",
       body: requestBody,
-      multipart_fields: canHaveBody && request.bodyMode === "multipart" ? request.multipartRows.map((row) => ({ ...row, name: resolve(row.name), value: resolve(row.value) })) : [],
+      multipart_fields: canHaveBody && request.bodyMode === "multipart" ? request.multipartRows.filter((row) => row.enabled).map((row) => ({ ...row, name: resolve(row.name), value: resolve(row.value) })) : [],
       binary_file: canHaveBody && request.bodyMode === "binary" && request.binaryFile ? request.binaryFile : null,
     };
   }
@@ -850,6 +918,7 @@ function App() {
     if (!workspace || runningCollection) return;
     setRunningCollection(true);
     setError("");
+    setResponseTab("Runner");
     const started = performance.now();
     const ids = new Set([collection.id]);
     let changed = true;
@@ -859,29 +928,40 @@ function App() {
         if (candidate.parentId && ids.has(candidate.parentId) && !ids.has(candidate.id)) { ids.add(candidate.id); changed = true; }
       });
     }
-    const items: RunItem[] = [];
-    for (const savedRequest of workspace.requests.filter((request) => ids.has(request.collectionId))) {
-      const itemStarted = performance.now();
-      try {
-        let built = buildSavedRequest(savedRequest);
-        if (savedRequest.scriptsEnabled && savedRequest.preRequestScript?.trim()) {
-          const scripted = await runSandboxScript(savedRequest.preRequestScript, { request: built, response: null, variables: variableValues(savedRequest.collectionId) });
-          built = scripted.request as typeof built;
+    try {
+      const items: RunItem[] = [];
+      for (const savedRequest of workspace.requests.filter((request) => ids.has(request.collectionId))) {
+        const itemStarted = performance.now();
+        try {
+          let built = buildSavedRequest(savedRequest);
+          let scriptTests: TestResult[] = [];
+          if (savedRequest.scriptsEnabled && savedRequest.preRequestScript?.trim()) {
+            const scripted = await runSandboxScript(savedRequest.preRequestScript, { request: built, response: null, variables: variableValues(savedRequest.collectionId) });
+            built = scripted.request as typeof built;
+            scriptTests = scripted.tests.map((test) => ({ ...test, name: `Pre-request: ${test.name}` }));
+          }
+          const result = await invoke<ApiResponse>("send_request", { request: { id: crypto.randomUUID(), method: savedRequest.method, ...built, timeout_ms: savedRequest.timeoutMs, follow_redirects: savedRequest.followRedirects } });
+          let tests = [...scriptTests, ...assertionResults(savedRequest.assertions ?? [], result)];
+          if (savedRequest.scriptsEnabled && savedRequest.postResponseScript?.trim()) {
+            try {
+              const scripted = await runSandboxScript(savedRequest.postResponseScript, { request: built, response: result, variables: variableValues(savedRequest.collectionId) });
+              tests = [...tests, ...scripted.tests];
+            } catch (scriptError) {
+              tests = [...tests, { name: "Post-response script", passed: false, message: String(scriptError) }];
+            }
+          }
+          items.push({ request_id: savedRequest.id, name: savedRequest.name, method: savedRequest.method, url: built.url, status: result.status, elapsed_ms: result.elapsed_ms, tests, error: "" });
+        } catch (runError) {
+          items.push({ request_id: savedRequest.id, name: savedRequest.name, method: savedRequest.method, url: savedRequest.url, status: null, elapsed_ms: Math.round(performance.now() - itemStarted), tests: [], error: String(runError) });
         }
-        const result = await invoke<ApiResponse>("send_request", { request: { id: crypto.randomUUID(), method: savedRequest.method, ...built, timeout_ms: savedRequest.timeoutMs, follow_redirects: savedRequest.followRedirects } });
-        let tests = assertionResults(savedRequest.assertions ?? [], result);
-        if (savedRequest.scriptsEnabled && savedRequest.postResponseScript?.trim()) {
-          const scripted = await runSandboxScript(savedRequest.postResponseScript, { request: built, response: result, variables: variableValues(savedRequest.collectionId) });
-          tests = [...tests, ...scripted.tests];
-        }
-        items.push({ request_id: savedRequest.id, name: savedRequest.name, method: savedRequest.method, url: result ? built.url : savedRequest.url, status: result.status, elapsed_ms: result.elapsed_ms, tests, error: "" });
-      } catch (runError) {
-        items.push({ request_id: savedRequest.id, name: savedRequest.name, method: savedRequest.method, url: savedRequest.url, status: null, elapsed_ms: Math.round(performance.now() - itemStarted), tests: [], error: String(runError) });
       }
+      const passed = items.filter((item) => !item.error && item.tests.every((test) => test.passed)).length;
+      setRunReport({ collection: collectionPath(collection), started_at: new Date().toISOString(), elapsed_ms: Math.round(performance.now() - started), passed, failed: items.length - passed, items });
+    } catch (runError) {
+      setError(String(runError));
+    } finally {
+      setRunningCollection(false);
     }
-    const passed = items.filter((item) => !item.error && item.tests.every((test) => test.passed)).length;
-    setRunReport({ collection: collectionPath(collection), started_at: new Date().toISOString(), elapsed_ms: Math.round(performance.now() - started), passed, failed: items.length - passed, items });
-    setRunningCollection(false);
   }
 
   async function exportRunReport(format: "json" | "junit") {
@@ -999,21 +1079,26 @@ function App() {
 
   async function saveVaultEntry(name: string, value: string) {
     const entries = { ...vaultEntries, [name]: value };
-    await invoke("save_vault", { entries });
     setVaultEntries(entries);
+    await queueWorkspaceWrite(() => invoke("save_vault", { entries }));
   }
 
   async function updateVariables(scope: typeof variableScope, variables: Variable[]) {
     if (!workspace) return;
     if (scope === "temporary") setTemporaryVariables(variables);
-    if (scope === "environment" && activeEnvironment) await updateEnvironment({ ...activeEnvironment, variables });
+    if (scope === "environment" && activeEnvironment) {
+      const environment = { ...activeEnvironment, variables };
+      setWorkspace((current) => current ? { ...current, environments: current.environments.map((item) => item.id === environment.id ? environment : item) } : current);
+      await queueWorkspaceWrite(() => invoke("save_workspace_environment", { environment }));
+    }
     if (scope === "collection" && activeCollection) {
-      await invoke("save_workspace_collection", { collection: { ...activeCollection, variables } });
-      setWorkspace({ ...workspace, collections: workspace.collections.map((item) => item.id === activeCollection.id ? { ...activeCollection, variables } : item) });
+      const collection = { ...activeCollection, variables };
+      setWorkspace((current) => current ? { ...current, collections: current.collections.map((item) => item.id === collection.id ? collection : item) } : current);
+      await queueWorkspaceWrite(() => invoke("save_workspace_collection", { collection }));
     }
     if (scope === "global") {
-      await invoke("save_workspace_globals", { variables });
-      setWorkspace({ ...workspace, global_variables: variables });
+      setWorkspace((current) => current ? { ...current, global_variables: variables } : current);
+      await queueWorkspaceWrite(() => invoke("save_workspace_globals", { variables }));
     }
   }
 
@@ -1034,9 +1119,74 @@ function App() {
     setSidebarView("environment");
   }
 
+  async function renameEnvironment() {
+    if (!activeEnvironment) return;
+    const name = window.prompt("Rename environment", activeEnvironment.name);
+    if (!name?.trim() || name.trim() === activeEnvironment.name) return;
+    await updateEnvironment({ ...activeEnvironment, name: name.trim() });
+    setNotice(`Renamed environment to "${name.trim()}".`);
+  }
+
+  async function deleteEnvironment() {
+    if (!activeEnvironment || !window.confirm(`Delete environment "${activeEnvironment.name}"?`)) return;
+    const environment = activeEnvironment;
+    setWorkspace((current) => current ? { ...current, environments: current.environments.filter((item) => item.id !== environment.id) } : current);
+    setActiveEnvironmentId("");
+    await queueWorkspaceWrite(() => invoke("delete_workspace_environment", { environmentId: environment.id }));
+    setNotice(`Deleted environment "${environment.name}".`);
+    await refreshWorkspace();
+  }
+
   async function updateEnvironment(environment: Environment) {
-    await invoke("save_workspace_environment", { environment });
     setWorkspace((current) => current ? { ...current, environments: current.environments.map((item) => item.id === environment.id ? environment : item) } : current);
+    await queueWorkspaceWrite(() => invoke("save_workspace_environment", { environment }));
+  }
+
+  async function toggleVariableSecret(index: number) {
+    const variable = variablesForScope()[index];
+    if (!variable) return;
+    if (!vaultEntries) {
+      setError("Unlock the vault before converting a variable to or from a secret.");
+      return;
+    }
+    const entries = { ...vaultEntries };
+    const variables = variablesForScope().map((item, itemIndex) => {
+      if (itemIndex !== index) return item;
+      if (item.secret) {
+        const value = entries[item.name] ?? item.value;
+        delete entries[item.name];
+        return { ...item, secret: false, value };
+      }
+      entries[item.name] = item.value;
+      return { ...item, secret: true, value: "" };
+    });
+    setVaultEntries(entries);
+    await queueWorkspaceWrite(() => invoke("save_vault", { entries }));
+    await updateVariables(variableScope, variables);
+  }
+
+  async function removeVariable(index: number) {
+    const variable = variablesForScope()[index];
+    if (!variable) return;
+    if (variable.secret && vaultEntries && variable.name in vaultEntries) {
+      const entries = { ...vaultEntries };
+      delete entries[variable.name];
+      setVaultEntries(entries);
+      await queueWorkspaceWrite(() => invoke("save_vault", { entries }));
+    }
+    await updateVariables(variableScope, variablesForScope().filter((_item, itemIndex) => itemIndex !== index));
+  }
+
+  function openHistoryEntry(entry: HistoryEntry) {
+    const linked = entry.request_id ? workspace?.requests.find((request) => request.id === entry.request_id) : undefined;
+    if (linked) {
+      loadRequest(linked);
+      return;
+    }
+    newRequest();
+    setMethod(entry.method);
+    setUrl(entry.url);
+    setRequestName(entry.name);
   }
 
   async function saveResponse() {
@@ -1098,15 +1248,16 @@ function App() {
           </section>}
           {workspace?.collections.filter((collection) => !collection.parentId).map((collection) => renderCollection(collection))}
         </nav></>}
-        {sidebarView === "history" && <nav aria-label="Request history"><p className="section-label">Recent requests</p>{workspace?.history.map((entry) => <button className="history-item" key={entry.id} onClick={() => { setMethod(entry.method); setUrl(entry.url); setRequestName(entry.name); }} type="button"><span className={methodColors[entry.method]}>{entry.method}</span><strong>{entry.name}</strong><small>{entry.status ?? "Failed"} · {new Date(entry.created_at).toLocaleString()}</small></button>)}</nav>}
-        {sidebarView === "environment" && <div className="environment-editor"><div className="environment-heading"><strong>Variables</strong><button onClick={addEnvironment} type="button">+ Environment</button></div>
+        {sidebarView === "history" && <nav aria-label="Request history"><p className="section-label">Recent requests</p>{workspace?.history.map((entry) => <button className="history-item" key={entry.id} onClick={() => openHistoryEntry(entry)} type="button"><span className={methodColors[entry.method]}>{entry.method}</span><strong>{entry.name}</strong><small>{entry.status ?? "Failed"} · {new Date(entry.created_at).toLocaleString()}</small></button>)}</nav>}
+        {sidebarView === "environment" && <div className="environment-editor"><div className="environment-heading"><strong>Variables</strong><div><button onClick={addEnvironment} type="button">+ Environment</button>{activeEnvironment && <><button onClick={renameEnvironment} type="button">Rename</button><button onClick={deleteEnvironment} type="button">Delete</button></>}</div></div>
           <select className="scope-select" value={variableScope} onChange={(event) => setVariableScope(event.target.value as typeof variableScope)} aria-label="Variable scope"><option value="temporary">Temporary</option><option value="environment">Environment</option><option value="collection">Collection</option><option value="global">Global</option></select>
           <p>{variableScope === "environment" ? activeEnvironment?.name ?? "No environment" : variableScope === "collection" ? activeCollection?.name : `${variableScope[0].toUpperCase()}${variableScope.slice(1)} scope`}</p>
           {variablesForScope().map((variable, index) => <div className="variable-row" key={`${variable.name}-${index}`}>
             <input aria-label="Enable variable" checked={variable.enabled} onChange={(event) => updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, enabled: event.target.checked } : item))} type="checkbox" />
             <input value={variable.name} onChange={(event) => updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item))} placeholder="Name" aria-label="Variable name" />
             <input type={variable.secret ? "password" : "text"} value={variable.secret && vaultEntries?.[variable.name] !== undefined ? vaultEntries[variable.name] : variable.value} onChange={(event) => variable.secret && vaultEntries ? saveVaultEntry(variable.name, event.target.value) : updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, value: event.target.value } : item))} placeholder={variable.secret && !vaultEntries ? "Unlock vault" : "Value"} aria-label="Variable value" />
-            <button title="Toggle secret" onClick={() => updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, secret: !item.secret, value: !item.secret ? "" : item.value } : item))} type="button">{variable.secret ? "Encrypted" : "Plain"}</button>
+            <div className="variable-actions"><button title="Toggle secret" onClick={() => toggleVariableSecret(index)} type="button">{variable.secret ? "Encrypted" : "Plain"}</button>
+            <button title="Remove variable" aria-label={`Remove variable ${variable.name || index + 1}`} onClick={() => removeVariable(index)} type="button">Remove</button></div>
           </div>)}
           <button className="add-variable" onClick={() => updateVariables(variableScope, [...variablesForScope(), { name: "", value: "", secret: false, enabled: true }])} type="button">+ Add variable</button>
         </div>}
