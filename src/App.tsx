@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
@@ -25,6 +25,46 @@ type AuthType = "none" | "basic" | "bearer" | "api-key";
 type BodyMode = "json" | "text" | "xml" | "form" | "multipart" | "binary";
 type ResponseView = "pretty" | "raw" | "preview";
 type MultipartRow = KeyValueRow & { kind: "text" | "file" };
+type Collection = { id: string; name: string };
+type Variable = { name: string; value: string; secret: boolean; enabled: boolean };
+type Environment = { id: string; name: string; variables: Variable[] };
+type HistoryEntry = {
+  id: string;
+  request_id: string | null;
+  name: string;
+  method: string;
+  url: string;
+  status: number | null;
+  elapsed_ms: number | null;
+  created_at: number;
+};
+type SavedRequest = {
+  id: string;
+  collectionId: string;
+  name: string;
+  method: string;
+  url: string;
+  params: KeyValueRow[];
+  headers: KeyValueRow[];
+  body: string;
+  bodyMode: BodyMode;
+  formRows: KeyValueRow[];
+  multipartRows: MultipartRow[];
+  binaryFile: string;
+  authType: AuthType;
+  authFields: Record<string, string>;
+  timeoutMs: number;
+  followRedirects: boolean;
+  favorite: boolean;
+};
+type WorkspaceSnapshot = {
+  root: string;
+  portable: boolean;
+  collections: Collection[];
+  requests: SavedRequest[];
+  environments: Environment[];
+  history: HistoryEntry[];
+};
 
 const methodColors: Record<string, string> = {
   GET: "method-get",
@@ -33,17 +73,6 @@ const methodColors: Record<string, string> = {
   PATCH: "method-patch",
   DELETE: "method-delete",
 };
-
-const requestGroups = [
-  { name: "Health checks", requests: [{ method: "GET", name: "Service status" }] },
-  {
-    name: "Users API",
-    requests: [
-      { method: "GET", name: "List users" },
-      { method: "POST", name: "Create user" },
-    ],
-  },
-];
 
 const emptyRow = (): KeyValueRow => ({
   id: Date.now() + Math.random(),
@@ -154,6 +183,9 @@ function KeyValueTable({
 }
 
 function App() {
+  const [requestId, setRequestId] = useState("");
+  const [requestName, setRequestName] = useState("Untitled request");
+  const [collectionId, setCollectionId] = useState("default");
   const [method, setMethod] = useState("GET");
   const [url, setUrl] = useState("https://jsonplaceholder.typicode.com/users/1");
   const [body, setBody] = useState('{\n  "name": "Ada",\n  "role": "developer"\n}');
@@ -177,7 +209,23 @@ function App() {
   const [response, setResponse] = useState<ApiResponse | null>(null);
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
+  const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null);
+  const [activeEnvironmentId, setActiveEnvironmentId] = useState("");
+  const [sidebarView, setSidebarView] = useState<"collections" | "history" | "environment">("collections");
+  const [search, setSearch] = useState("");
+  const [notice, setNotice] = useState("");
+  const [saved, setSaved] = useState(true);
   const activeRequestId = useRef("");
+
+  async function refreshWorkspace() {
+    const loaded = await invoke<WorkspaceSnapshot>("load_workspace");
+    setWorkspace(loaded);
+    if (!activeEnvironmentId && loaded.environments.length) setActiveEnvironmentId(loaded.environments[0].id);
+  }
+
+  useEffect(() => {
+    refreshWorkspace().catch((workspaceError) => setError(String(workspaceError)));
+  }, []);
 
   const responseBody = useMemo(
     () => (responseView === "pretty" && response ? prettyBody(response.body) : response?.body ?? ""),
@@ -188,11 +236,36 @@ function App() {
     return responseBody.toLowerCase().split(responseSearch.toLowerCase()).length - 1;
   }, [responseBody, responseSearch]);
   const cookies = useMemo(() => (response ? parseCookies(response.headers) : []), [response]);
+  const activeEnvironment = workspace?.environments.find((environment) => environment.id === activeEnvironmentId);
+  const visibleRequests = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return (workspace?.requests ?? []).filter((request) =>
+      !query || [request.name, request.url, request.method].some((value) => value.toLowerCase().includes(query)),
+    );
+  }, [search, workspace]);
+
+  function resolveVariables(value: string) {
+    const variables = new Map(
+      (activeEnvironment?.variables ?? [])
+        .filter((variable) => variable.enabled)
+        .map((variable) => [variable.name, variable.value]),
+    );
+    const unresolved: string[] = [];
+    const resolved = value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, name: string) => {
+      if (!variables.has(name)) {
+        unresolved.push(name);
+        return `{{${name}}}`;
+      }
+      return variables.get(name) ?? "";
+    });
+    if (unresolved.length) throw new Error(`Unresolved variables: ${[...new Set(unresolved)].join(", ")}`);
+    return resolved;
+  }
 
   function buildRequest() {
-    const requestUrl = new URL(url);
-    params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(row.name, row.value));
-    const requestHeaders = headers.map((header) => ({ ...header }));
+    const requestUrl = new URL(resolveVariables(url));
+    params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(resolveVariables(row.name), resolveVariables(row.value)));
+    const requestHeaders = headers.map((header) => ({ ...header, name: resolveVariables(header.name), value: resolveVariables(header.value) }));
     const contentTypes: Partial<Record<BodyMode, string>> = {
       json: "application/json",
       text: "text/plain",
@@ -219,10 +292,10 @@ function App() {
     }
 
     const canHaveBody = !["GET", "HEAD"].includes(method);
-    let requestBody: string | null = canHaveBody ? body : null;
+    let requestBody: string | null = canHaveBody ? resolveVariables(body) : null;
     if (requestBody !== null && bodyMode === "form") {
       requestBody = new URLSearchParams(
-        formRows.filter((row) => row.enabled && row.name).map((row) => [row.name, row.value]),
+        formRows.filter((row) => row.enabled && row.name).map((row) => [resolveVariables(row.name), resolveVariables(row.value)]),
       ).toString();
     }
     if (bodyMode === "multipart" || bodyMode === "binary") requestBody = null;
@@ -256,6 +329,18 @@ function App() {
       });
       setResponse(result);
       setResponseTab("Body");
+      const entry: HistoryEntry = {
+        id: crypto.randomUUID(),
+        request_id: requestId || null,
+        name: requestName,
+        method,
+        url,
+        status: result.status,
+        elapsed_ms: result.elapsed_ms,
+        created_at: Date.now(),
+      };
+      await invoke("add_workspace_history", { entry });
+      await refreshWorkspace();
     } catch (requestError) {
       setResponse(null);
       setError(String(requestError));
@@ -280,6 +365,143 @@ function App() {
     if (selected) onSelected(selected);
   }
 
+  function currentRequest(): SavedRequest {
+    return {
+      id: requestId || crypto.randomUUID(),
+      collectionId,
+      name: requestName.trim() || "Untitled request",
+      method,
+      url,
+      params,
+      headers,
+      body,
+      bodyMode,
+      formRows,
+      multipartRows,
+      binaryFile,
+      authType,
+      authFields,
+      timeoutMs,
+      followRedirects,
+      favorite: false,
+    };
+  }
+
+  async function saveRequest() {
+    const request = currentRequest();
+    await invoke("save_workspace_request", { request });
+    setRequestId(request.id);
+    setRequestName(request.name);
+    setSaved(true);
+    setNotice(`Saved "${request.name}".`);
+    await refreshWorkspace();
+  }
+
+  function loadRequest(request: SavedRequest) {
+    setRequestId(request.id);
+    setCollectionId(request.collectionId);
+    setRequestName(request.name);
+    setMethod(request.method);
+    setUrl(request.url);
+    setParams(request.params);
+    setHeaders(request.headers);
+    setBody(request.body);
+    setBodyMode(request.bodyMode);
+    setFormRows(request.formRows);
+    setMultipartRows(request.multipartRows);
+    setBinaryFile(request.binaryFile);
+    setAuthType(request.authType);
+    setAuthFields({ username: "", password: "", token: "", key: "", value: "", location: "header", ...request.authFields });
+    setTimeoutMs(request.timeoutMs);
+    setFollowRedirects(request.followRedirects);
+    setResponse(null);
+    setError("");
+    setSaved(true);
+  }
+
+  function newRequest() {
+    setRequestId("");
+    setRequestName("Untitled request");
+    setMethod("GET");
+    setUrl("https://");
+    setParams([emptyRow()]);
+    setHeaders([{ id: 1, name: "Accept", value: "application/json", enabled: true }]);
+    setBody("");
+    setResponse(null);
+    setSaved(false);
+  }
+
+  async function createCollection() {
+    const name = window.prompt("Collection name");
+    if (!name?.trim()) return;
+    const collection = await invoke<Collection>("create_workspace_collection", { name });
+    setCollectionId(collection.id);
+    await refreshWorkspace();
+  }
+
+  async function importFile() {
+    const path = await open({ multiple: false, directory: false, filters: [{ name: "API files", extensions: ["json"] }] });
+    if (!path) return;
+    const result = await invoke<{ message: string }>("import_workspace_file", { path });
+    setNotice(result.message);
+    await refreshWorkspace();
+  }
+
+  async function importCurl() {
+    const command = window.prompt("Paste a cURL command");
+    if (!command?.trim()) return;
+    const tokens = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((token) => token.replace(/^(['"])(.*)\1$/, "$2")) ?? [];
+    let importedMethod = "GET";
+    let importedUrl = "";
+    let importedBody = "";
+    const importedHeaders: KeyValueRow[] = [];
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if ((token === "-X" || token === "--request") && tokens[index + 1]) importedMethod = tokens[++index].toUpperCase();
+      else if ((token === "-H" || token === "--header") && tokens[index + 1]) {
+        const header = tokens[++index];
+        const separator = header.indexOf(":");
+        importedHeaders.push({ ...emptyRow(), name: header.slice(0, separator).trim(), value: header.slice(separator + 1).trim() });
+      } else if (["-d", "--data", "--data-raw"].includes(token) && tokens[index + 1]) {
+        importedBody = tokens[++index];
+        if (importedMethod === "GET") importedMethod = "POST";
+      } else if (/^https?:\/\//.test(token)) importedUrl = token;
+    }
+    if (!importedUrl) {
+      setError("The cURL command does not contain an HTTP URL.");
+      return;
+    }
+    newRequest();
+    setRequestName("Imported cURL request");
+    setMethod(importedMethod);
+    setUrl(importedUrl);
+    setHeaders(importedHeaders.length ? importedHeaders : [{ id: 1, name: "Accept", value: "application/json", enabled: true }]);
+    setBody(importedBody);
+    setNotice("Imported cURL into a new unsaved request.");
+  }
+
+  async function exportPortable() {
+    const path = await save({ defaultPath: "api-lantern-portable-workspace.zip", filters: [{ name: "ZIP archive", extensions: ["zip"] }] });
+    if (!path) return;
+    await invoke("export_portable_workspace", { path });
+    setNotice("Exported a portable workspace without secrets.");
+  }
+
+  async function addEnvironment() {
+    const name = window.prompt("Environment name");
+    if (!name?.trim()) return;
+    const environment: Environment = { id: crypto.randomUUID(), name: name.trim(), variables: [] };
+    await invoke("save_workspace_environment", { environment });
+    setActiveEnvironmentId(environment.id);
+    await refreshWorkspace();
+    setSidebarView("environment");
+  }
+
+  async function updateEnvironment(environment: Environment) {
+    await invoke("save_workspace_environment", { environment });
+    setWorkspace((current) => current ? { ...current, environments: current.environments.map((item) => item.id === environment.id ? environment : item) } : current);
+  }
+
   async function saveResponse() {
     if (!response) return;
     const path = await save({
@@ -299,32 +521,44 @@ function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand"><span className="brand-mark">A</span><strong>API Lantern</strong><span className="local-pill">Local only</span></div>
-        <label className="environment"><span>Environment</span><select aria-label="Active environment" defaultValue="Local"><option>Local</option><option>Staging</option><option>Production</option></select></label>
+        <div className="brand"><span className="brand-mark">A</span><strong>API Lantern</strong><span className="local-pill">{workspace?.portable ? "Portable" : "Local only"}</span></div>
+        <div className="top-actions">
+          {notice && <span className="notice">{notice}</span>}
+          <button type="button" onClick={importFile}>Import</button>
+          <button type="button" onClick={importCurl}>cURL</button>
+          <button type="button" onClick={exportPortable}>Portable ZIP</button>
+          <label className="environment"><span>Environment</span><select aria-label="Active environment" value={activeEnvironmentId} onChange={(event) => setActiveEnvironmentId(event.target.value)}><option value="">No environment</option>{workspace?.environments.map((environment) => <option key={environment.id} value={environment.id}>{environment.name}</option>)}</select></label>
+          <button type="button" onClick={() => setSidebarView("environment")}>Variables</button>
+        </div>
       </header>
 
       <aside className="sidebar">
-        <div className="sidebar-actions"><button className="new-button" type="button">+ New request</button><button className="icon-button" type="button" aria-label="More actions">...</button></div>
-        <input className="search" placeholder="Search requests..." aria-label="Search requests" />
+        <div className="sidebar-actions"><button className="new-button" onClick={newRequest} type="button">+ New request</button><button className="icon-button" onClick={createCollection} type="button" aria-label="New collection">+</button></div>
+        <div className="sidebar-switcher"><button className={sidebarView === "collections" ? "active" : ""} onClick={() => setSidebarView("collections")} type="button">Collections</button><button className={sidebarView === "history" ? "active" : ""} onClick={() => setSidebarView("history")} type="button">History</button></div>
+        {sidebarView === "collections" && <><input className="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search requests..." aria-label="Search requests" />
         <nav aria-label="Collections">
-          <p className="section-label">Collections</p>
-          {requestGroups.map((group) => (
-            <section className="collection" key={group.name}>
-              <h2><span>⌄</span> {group.name}</h2>
-              {group.requests.map((request) => <button className="request-item" key={request.name} type="button"><span className={methodColors[request.method]}>{request.method}</span>{request.name}</button>)}
+          {workspace?.collections.map((collection) => (
+            <section className="collection" key={collection.id}>
+              <h2><span>⌄</span> {collection.name}</h2>
+              {visibleRequests.filter((request) => request.collectionId === collection.id).map((request) => <button className="request-item" key={request.id} onClick={() => loadRequest(request)} type="button"><span className={methodColors[request.method]}>{request.method}</span>{request.name}</button>)}
             </section>
           ))}
-        </nav>
+        </nav></>}
+        {sidebarView === "history" && <nav aria-label="Request history"><p className="section-label">Recent requests</p>{workspace?.history.map((entry) => <button className="history-item" key={entry.id} onClick={() => { setMethod(entry.method); setUrl(entry.url); setRequestName(entry.name); }} type="button"><span className={methodColors[entry.method]}>{entry.method}</span><strong>{entry.name}</strong><small>{entry.status ?? "Failed"} · {new Date(entry.created_at).toLocaleString()}</small></button>)}</nav>}
+        {sidebarView === "environment" && <div className="environment-editor"><div className="environment-heading"><strong>Variables</strong><button onClick={addEnvironment} type="button">+ Environment</button></div>{activeEnvironment ? <><p>{activeEnvironment.name}</p>{activeEnvironment.variables.map((variable, index) => <div className="variable-row" key={`${variable.name}-${index}`}><input aria-label="Enable variable" checked={variable.enabled} onChange={(event) => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, enabled: event.target.checked } : item) })} type="checkbox" /><input value={variable.name} onChange={(event) => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) })} placeholder="Name" /><input type={variable.secret ? "password" : "text"} value={variable.value} onChange={(event) => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, value: event.target.value } : item) })} placeholder="Value" /><button title="Toggle secret" onClick={() => updateEnvironment({ ...activeEnvironment, variables: activeEnvironment.variables.map((item, itemIndex) => itemIndex === index ? { ...item, secret: !item.secret } : item) })} type="button">{variable.secret ? "Masked" : "Plain"}</button></div>)}<button className="add-variable" onClick={() => updateEnvironment({ ...activeEnvironment, variables: [...activeEnvironment.variables, { name: "", value: "", secret: false, enabled: true }] })} type="button">+ Add variable</button></> : <div className="empty-state">Choose or create an environment.</div>}</div>}
         <div className="privacy-note"><strong>Your data stays here.</strong><span>No account, cloud, or telemetry.</span></div>
       </aside>
 
       <section className="workspace">
-        <div className="request-tabs"><button className="open-tab active" type="button"><span className={methodColors[method]}>{method}</span>Service status<span className="unsaved-dot" aria-label="Unsaved changes" /></button><button className="tab-add" type="button" aria-label="New tab">+</button></div>
+        <div className="request-tabs"><button className="open-tab active" type="button"><span className={methodColors[method]}>{method}</span>{requestName}{!saved && <span className="unsaved-dot" aria-label="Unsaved changes" />}</button><button className="tab-add" onClick={newRequest} type="button" aria-label="New tab">+</button></div>
 
         <form className="request-panel" onSubmit={sendRequest}>
           <div className="request-line">
+            <input className="request-name" value={requestName} onChange={(event) => { setRequestName(event.target.value); setSaved(false); }} aria-label="Request name" />
+            <select className="collection-select" value={collectionId} onChange={(event) => { setCollectionId(event.target.value); setSaved(false); }} aria-label="Collection">{workspace?.collections.map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}</select>
             <select value={method} onChange={(event) => setMethod(event.target.value)} aria-label="HTTP method">{["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].map((item) => <option key={item}>{item}</option>)}</select>
             <input value={url} onChange={(event) => setUrl(event.target.value)} aria-label="Request URL" />
+            <button className="save-button" onClick={saveRequest} type="button">Save</button>
             {sending ? <button className="cancel-button" onClick={cancelRequest} type="button">Cancel</button> : <button className="send-button" type="submit">Send</button>}
           </div>
 

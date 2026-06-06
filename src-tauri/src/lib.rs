@@ -8,6 +8,8 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+mod workspace;
+
 #[derive(Default)]
 struct RequestState {
     cancellations: Mutex<HashMap<String, oneshot::Sender<()>>>,
@@ -235,6 +237,61 @@ fn cancel_request(request_id: String, state: tauri::State<'_, RequestState>) -> 
     Ok(())
 }
 
+#[tauri::command]
+fn load_workspace(app: tauri::AppHandle) -> Result<workspace::WorkspaceSnapshot, String> {
+    workspace::load(&app)
+}
+
+#[tauri::command]
+fn save_workspace_request(
+    app: tauri::AppHandle,
+    request: workspace::SavedRequest,
+) -> Result<(), String> {
+    workspace::save_request(&app, &request)
+}
+
+#[tauri::command]
+fn delete_workspace_request(app: tauri::AppHandle, request_id: String) -> Result<(), String> {
+    workspace::delete_request(&app, &request_id)
+}
+
+#[tauri::command]
+fn create_workspace_collection(
+    app: tauri::AppHandle,
+    name: String,
+) -> Result<workspace::Collection, String> {
+    workspace::create_collection(&app, &name)
+}
+
+#[tauri::command]
+fn save_workspace_environment(
+    app: tauri::AppHandle,
+    environment: workspace::Environment,
+) -> Result<(), String> {
+    workspace::save_environment(&app, &environment)
+}
+
+#[tauri::command]
+fn add_workspace_history(
+    app: tauri::AppHandle,
+    entry: workspace::HistoryEntry,
+) -> Result<(), String> {
+    workspace::add_history(&app, &entry)
+}
+
+#[tauri::command]
+fn import_workspace_file(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<workspace::ImportResult, String> {
+    workspace::import_file(&app, &path)
+}
+
+#[tauri::command]
+fn export_portable_workspace(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    workspace::export_portable(&app, &path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -244,7 +301,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             send_request,
             cancel_request,
-            save_response
+            save_response,
+            load_workspace,
+            save_workspace_request,
+            delete_workspace_request,
+            create_workspace_collection,
+            save_workspace_environment,
+            add_workspace_history,
+            import_workspace_file,
+            export_portable_workspace
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -26,3 +26,4 @@ serde_json = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "rustls"] }
 tokio = { version = "1", features = ["fs", "macros", "sync"] }
 base64 = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }
