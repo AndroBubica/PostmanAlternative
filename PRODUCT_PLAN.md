@@ -280,11 +280,25 @@ Donations and sponsorship are acceptable, but must not unlock functionality.
 
 ### Phase 0: Prototype
 
-- Tauri shell and basic GUI
-- Send one HTTP request through the Rust core
-- Display status, headers, and pretty JSON
-- Confirm Windows and macOS builds
-- Prove portable-mode storage beside the executable
+**Status: In progress**
+
+Validated on June 6, 2026:
+
+- [x] Tauri shell and basic GUI
+- [x] Send one HTTP request through the Rust core
+- [x] Display status, headers, and pretty JSON
+- [ ] Confirm Windows and macOS builds
+  - macOS Apple Silicon application bundle builds and launches successfully.
+  - Windows build has not yet been confirmed.
+- [ ] Prove portable-mode storage beside the executable
+  - No `portable.flag` detection or portable storage implementation exists yet.
+
+Validation commands passed:
+
+- `corepack pnpm check`
+- `cargo check`
+- `cargo test`
+- `corepack pnpm tauri build --bundles app`
 
 ### Phase 1: MVP
 
