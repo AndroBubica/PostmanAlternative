@@ -3,8 +3,9 @@
 API Lantern is a free, open-source, local-first API client. It has no accounts,
 subscriptions, cloud dependency, or telemetry.
 
-The current codebase is a Phase 0 prototype built with Tauri 2, React,
-TypeScript, Rust, and Oxlint.
+The current codebase is a Phase 1 MVP in progress, built with Tauri 2, React,
+TypeScript, Rust, and Oxlint. The everyday single-request workflow is working;
+local workspace persistence and collections are the next milestone.
 
 ## Development
 

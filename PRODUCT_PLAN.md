@@ -302,7 +302,15 @@ Validation commands passed:
 
 ### Phase 1: MVP
 
-- Complete request editor and response viewer
+**Status: In progress**
+
+- [ ] Complete request editor and response viewer
+  - [x] Query parameters and editable headers
+  - [x] JSON, text, XML, and form URL encoded bodies
+  - [x] Basic, Bearer token, and API key authentication
+  - [x] Request timeout, redirect control, and cancellation
+  - [x] Pretty/raw response body, response search, copy, headers, and metadata
+  - [ ] Multipart, binary files, response preview, cookies, and save to file
 - Collections, folders, history, variables, environments
 - Plain-text workspace format
 - cURL and Postman import
