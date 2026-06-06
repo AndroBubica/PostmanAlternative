@@ -53,10 +53,10 @@ jobs:
           $hash = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
           [System.IO.File]::WriteAllText(
             "${{ matrix.archive }}.sha256",
-            "$hash  ${{ matrix.archive }}`n",
+            "$hash  ${{ matrix.archive }}",
             [System.Text.UTF8Encoding]::new($false)
           )
-      - name: Verify Windows portable package
+      - name: Verify Windows portable archive
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -78,9 +78,14 @@ jobs:
           if ($actual -ne $expected) { throw "Portable package checksum mismatch." }
           $checksumBytes = [System.IO.File]::ReadAllBytes("${{ matrix.archive }}.sha256")
           if ($checksumBytes -contains 13) { throw "Checksum file must use portable LF line endings." }
+      - name: Smoke test Windows portable mode
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = "release/verify-windows/API-Lantern"
           $process = Start-Process -FilePath "$root/Windows-x64/api-lantern.exe" -PassThru
           Start-Sleep -Seconds 5
-          if (-not $process.HasExited) { Stop-Process -Id $process.Id }
+          if (-not $process.HasExited) { Stop-Process -Id $process.Id -ErrorAction SilentlyContinue }
           if (-not (Test-Path "$root/workspace/api-lantern.json")) {
             throw "Packaged Windows app did not create its portable workspace."
           }
