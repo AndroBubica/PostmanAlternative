@@ -31,3 +31,28 @@ entire `private` directory and clear secret values and request credentials.
 
 Variables resolve from lowest to highest priority: global, collection,
 environment, temporary. Disabled variables are ignored.
+
+Saved request files may include these Phase 2 testing fields:
+
+```json
+{
+  "preRequestScript": "",
+  "postResponseScript": "",
+  "scriptsEnabled": false,
+  "assertions": [
+    {
+      "id": "portable-id",
+      "kind": "status",
+      "operator": "equals",
+      "target": "",
+      "expected": "200",
+      "enabled": true
+    }
+  ]
+}
+```
+
+Supported assertion kinds are `status`, `header`, `json-path`,
+`response-time`, and `body`. Supported operators are `equals`, `not-equals`,
+`contains`, `exists`, and `less-than`. Scripts are never enabled automatically
+when imported.

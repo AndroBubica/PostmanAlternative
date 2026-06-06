@@ -25,6 +25,14 @@ type AuthType = "none" | "basic" | "bearer" | "api-key";
 type BodyMode = "json" | "text" | "xml" | "form" | "multipart" | "binary";
 type ResponseView = "pretty" | "raw" | "preview";
 type MultipartRow = KeyValueRow & { kind: "text" | "file" };
+type RequestAssertion = {
+  id: string;
+  kind: "status" | "header" | "json-path" | "response-time" | "body";
+  operator: "equals" | "not-equals" | "contains" | "exists" | "less-than";
+  target: string;
+  expected: string;
+  enabled: boolean;
+};
 type Collection = { id: string; name: string; parentId?: string; variables: Variable[] };
 type Variable = { name: string; value: string; secret: boolean; enabled: boolean };
 type Environment = { id: string; name: string; variables: Variable[] };
@@ -56,6 +64,10 @@ type SavedRequest = {
   timeoutMs: number;
   followRedirects: boolean;
   favorite: boolean;
+  preRequestScript: string;
+  postResponseScript: string;
+  scriptsEnabled: boolean;
+  assertions: RequestAssertion[];
 };
 type WorkspaceSnapshot = {
   root: string;
@@ -70,6 +82,9 @@ type WorkspaceSnapshot = {
 
 type OpenTab = { key: string; request: SavedRequest; response: ApiResponse | null; error: string };
 type UndoAction = { message: string; run: () => Promise<void> };
+type TestResult = { name: string; passed: boolean; message: string };
+type RunItem = { request_id: string; name: string; method: string; url: string; status: number | null; elapsed_ms: number; tests: TestResult[]; error: string };
+type RunReport = { collection: string; started_at: string; elapsed_ms: number; passed: number; failed: number; items: RunItem[] };
 
 const methodColors: Record<string, string> = {
   GET: "method-get",
@@ -243,6 +258,13 @@ function App() {
   const [notice, setNotice] = useState("");
   const [saved, setSaved] = useState(true);
   const [favorite, setFavorite] = useState(false);
+  const [preRequestScript, setPreRequestScript] = useState("");
+  const [postResponseScript, setPostResponseScript] = useState("");
+  const [scriptsEnabled, setScriptsEnabled] = useState(false);
+  const [assertions, setAssertions] = useState<RequestAssertion[]>([]);
+  const [testResults, setTestResults] = useState<TestResult[]>([]);
+  const [runReport, setRunReport] = useState<RunReport | null>(null);
+  const [runningCollection, setRunningCollection] = useState(false);
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
   const [activeTabKey, setActiveTabKey] = useState("");
   const [temporaryVariables, setTemporaryVariables] = useState<Variable[]>([]);
@@ -278,7 +300,7 @@ function App() {
       return;
     }
     setSaved(false);
-  }, [requestName, collectionId, method, url, body, bodyMode, params, headers, formRows, multipartRows, binaryFile, authType, authFields, timeoutMs, followRedirects, favorite]);
+  }, [requestName, collectionId, method, url, body, bodyMode, params, headers, formRows, multipartRows, binaryFile, authType, authFields, timeoutMs, followRedirects, favorite, preRequestScript, postResponseScript, scriptsEnabled, assertions]);
 
   useEffect(() => {
     if (saved || !requestId || !workspace?.settings.autosave) return;
@@ -401,6 +423,101 @@ function App() {
     };
   }
 
+  function runSandboxScript(
+    script: string,
+    context: { request: Record<string, unknown>; response: ApiResponse | null; variables: Record<string, string> },
+  ): Promise<{ request: Record<string, unknown>; variables: Record<string, string>; tests: TestResult[] }> {
+    const workerSource = `
+      self.fetch = undefined; self.XMLHttpRequest = undefined; self.WebSocket = undefined; self.EventSource = undefined;
+      self.WebTransport = undefined; self.Worker = undefined; self.SharedWorker = undefined; self.importScripts = undefined;
+      self.onmessage = ({ data }) => {
+        const tests = [];
+        const lantern = {
+          setVariable(name, value) { data.variables[String(name)] = String(value); },
+          getVariable(name) { return data.variables[String(name)]; },
+          test(name, fn) {
+            try { fn(); tests.push({ name: String(name), passed: true, message: "" }); }
+            catch (error) { tests.push({ name: String(name), passed: false, message: String(error?.message || error) }); }
+          },
+          expect(value) {
+            return {
+              toEqual(expected) { if (value !== expected) throw new Error(JSON.stringify(value) + " did not equal " + JSON.stringify(expected)); },
+              toContain(expected) { if (!String(value).includes(String(expected))) throw new Error(JSON.stringify(value) + " did not contain " + JSON.stringify(expected)); },
+              toBeLessThan(expected) { if (!(Number(value) < Number(expected))) throw new Error(value + " was not less than " + expected); }
+            };
+          }
+        };
+        try {
+          Function("lantern", "request", "response", "variables", '"use strict";\\n' + data.script)(lantern, data.request, data.response, data.variables);
+          self.postMessage({ request: data.request, variables: data.variables, tests });
+        } catch (error) {
+          self.postMessage({ error: String(error?.message || error), request: data.request, variables: data.variables, tests });
+        }
+      };
+    `;
+    return new Promise((resolve, reject) => {
+      const objectUrl = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+      const worker = new Worker(objectUrl);
+      const timeout = window.setTimeout(() => {
+        worker.terminate();
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Script stopped after the 1 second sandbox limit."));
+      }, 1000);
+      worker.onmessage = (event) => {
+        window.clearTimeout(timeout);
+        worker.terminate();
+        URL.revokeObjectURL(objectUrl);
+        if (event.data.error) reject(new Error(event.data.error));
+        else resolve(event.data);
+      };
+      worker.onerror = (event) => {
+        window.clearTimeout(timeout);
+        worker.terminate();
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error(event.message));
+      };
+      worker.postMessage({ script, ...context });
+    });
+  }
+
+  function variableValues(requestCollectionId = collectionId) {
+    const values: Record<string, string> = {};
+    const add = (variables: Variable[]) => variables.filter((variable) => variable.enabled && variable.name).forEach((variable) => {
+      values[variable.name] = variable.secret && vaultEntries?.[variable.name] !== undefined ? vaultEntries[variable.name] : variable.value;
+    });
+    add(workspace?.global_variables ?? []);
+    add(workspace?.collections.find((item) => item.id === requestCollectionId)?.variables ?? []);
+    add(activeEnvironment?.variables ?? []);
+    add(temporaryVariables);
+    return values;
+  }
+
+  function assertionResults(items: RequestAssertion[], result: ApiResponse): TestResult[] {
+    const jsonPath = (path: string) => {
+      let value: unknown = JSON.parse(result.body);
+      for (const key of path.replace(/^\$\.?/, "").split(".").filter(Boolean)) value = (value as Record<string, unknown>)?.[key];
+      return value;
+    };
+    return items.filter((item) => item.enabled).map((item) => {
+      let actual: unknown;
+      try {
+        if (item.kind === "status") actual = result.status;
+        if (item.kind === "response-time") actual = result.elapsed_ms;
+        if (item.kind === "body") actual = result.body;
+        if (item.kind === "header") actual = result.headers.find((header) => header.name.toLowerCase() === item.target.toLowerCase())?.value;
+        if (item.kind === "json-path") actual = jsonPath(item.target);
+        const passed = item.operator === "exists" ? actual !== undefined && actual !== null
+          : item.operator === "contains" ? String(actual).includes(item.expected)
+          : item.operator === "not-equals" ? String(actual) !== item.expected
+          : item.operator === "less-than" ? Number(actual) < Number(item.expected)
+          : String(actual) === item.expected;
+        return { name: `${item.kind} ${item.target || item.operator}`, passed, message: passed ? "" : `Expected ${item.operator} ${item.expected || "a value"}, received ${JSON.stringify(actual)}` };
+      } catch (assertionError) {
+        return { name: `${item.kind} ${item.target || item.operator}`, passed: false, message: String(assertionError) };
+      }
+    });
+  }
+
   async function sendRequest(event: FormEvent) {
     event.preventDefault();
     setSending(true);
@@ -408,7 +525,11 @@ function App() {
     const requestId = crypto.randomUUID();
     activeRequestId.current = requestId;
     try {
-      const built = buildRequest();
+      let built = buildRequest();
+      if (scriptsEnabled && preRequestScript.trim()) {
+        const scripted = await runSandboxScript(preRequestScript, { request: built, response: null, variables: variableValues() });
+        built = scripted.request as typeof built;
+      }
       const result = await invoke<ApiResponse>("send_request", {
         request: {
           id: requestId,
@@ -419,6 +540,12 @@ function App() {
         },
       });
       setResponse(result);
+      let results = assertionResults(assertions, result);
+      if (scriptsEnabled && postResponseScript.trim()) {
+        const scripted = await runSandboxScript(postResponseScript, { request: built, response: result, variables: variableValues() });
+        results = [...results, ...scripted.tests];
+      }
+      setTestResults(results);
       setResponseTab("Body");
       const entry: HistoryEntry = {
         id: crypto.randomUUID(),
@@ -434,6 +561,7 @@ function App() {
       await refreshWorkspace();
     } catch (requestError) {
       setResponse(null);
+      setTestResults([]);
       setError(String(requestError));
     } finally {
       activeRequestId.current = "";
@@ -475,6 +603,10 @@ function App() {
       timeoutMs,
       followRedirects,
       favorite,
+      preRequestScript,
+      postResponseScript,
+      scriptsEnabled,
+      assertions,
     };
   }
 
@@ -522,6 +654,11 @@ function App() {
     setTimeoutMs(request.timeoutMs);
     setFollowRedirects(request.followRedirects);
     setFavorite(request.favorite);
+    setPreRequestScript(request.preRequestScript ?? "");
+    setPostResponseScript(request.postResponseScript ?? "");
+    setScriptsEnabled(request.scriptsEnabled ?? false);
+    setAssertions(request.assertions ?? []);
+    setTestResults([]);
     setResponse(tabResponse);
     setError(tabError);
     setSaved(true);
@@ -546,6 +683,7 @@ function App() {
       params: [emptyRow()], headers: [{ id: 1, name: "Accept", value: "application/json", enabled: true }],
       body: "", bodyMode: "json", formRows: [emptyRow()], multipartRows: [emptyMultipartRow()], binaryFile: "",
       authType: "none", authFields: {}, timeoutMs: 30000, followRedirects: true, favorite: false,
+      preRequestScript: "", postResponseScript: "", scriptsEnabled: false, assertions: [],
     };
     const tab = { key: crypto.randomUUID(), request: blank, response: null, error: "" };
     setOpenTabs((current) => [...current, tab]);
@@ -560,6 +698,11 @@ function App() {
     setBody("");
     setResponse(null);
     setFavorite(false);
+    setPreRequestScript("");
+    setPostResponseScript("");
+    setScriptsEnabled(false);
+    setAssertions([]);
+    setTestResults([]);
     setSaved(false);
   }
 
@@ -667,6 +810,90 @@ function App() {
     await refreshWorkspace();
   }
 
+  function buildSavedRequest(request: SavedRequest) {
+    const variables = variableValues(request.collectionId);
+    const resolve = (value: string) => value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, name: string) => {
+      if (!(name in variables)) throw new Error(`Unresolved variable: ${name}`);
+      return variables[name];
+    });
+    const requestUrl = new URL(resolve(request.url));
+    request.params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(resolve(row.name), resolve(row.value)));
+    const requestHeaders = request.headers.map((header) => ({ ...header, name: resolve(header.name), value: resolve(header.value) }));
+    const contentTypes: Partial<Record<BodyMode, string>> = { json: "application/json", text: "text/plain", xml: "application/xml", form: "application/x-www-form-urlencoded", binary: "application/octet-stream" };
+    const contentType = requestHeaders.find((header) => header.name.toLowerCase() === "content-type");
+    if (request.bodyMode === "multipart") {
+      if (contentType) contentType.enabled = false;
+    } else if (contentTypes[request.bodyMode]) {
+      if (contentType) contentType.value = contentTypes[request.bodyMode]!;
+      else requestHeaders.push({ id: -2, name: "Content-Type", value: contentTypes[request.bodyMode]!, enabled: true });
+    }
+    if (request.authType === "basic") requestHeaders.push({ id: -1, name: "Authorization", value: `Basic ${btoa(`${resolve(request.authFields.username ?? "")}:${resolve(request.authFields.password ?? "")}`)}`, enabled: true });
+    if (request.authType === "bearer") requestHeaders.push({ id: -1, name: "Authorization", value: `Bearer ${resolve(request.authFields.token ?? "")}`, enabled: true });
+    if (request.authType === "api-key" && request.authFields.key) {
+      if (request.authFields.location === "query") requestUrl.searchParams.append(resolve(request.authFields.key), resolve(request.authFields.value ?? ""));
+      else requestHeaders.push({ id: -1, name: resolve(request.authFields.key), value: resolve(request.authFields.value ?? ""), enabled: true });
+    }
+    const canHaveBody = !["GET", "HEAD"].includes(request.method);
+    let requestBody: string | null = canHaveBody ? resolve(request.body) : null;
+    if (canHaveBody && request.bodyMode === "form") requestBody = new URLSearchParams(request.formRows.filter((row) => row.enabled && row.name).map((row) => [resolve(row.name), resolve(row.value)])).toString();
+    if (["multipart", "binary"].includes(request.bodyMode)) requestBody = null;
+    return {
+      url: requestUrl.toString(), headers: requestHeaders,
+      body_kind: canHaveBody && ["multipart", "binary"].includes(request.bodyMode) ? request.bodyMode : "text",
+      body: requestBody,
+      multipart_fields: canHaveBody && request.bodyMode === "multipart" ? request.multipartRows.map((row) => ({ ...row, name: resolve(row.name), value: resolve(row.value) })) : [],
+      binary_file: canHaveBody && request.bodyMode === "binary" && request.binaryFile ? request.binaryFile : null,
+    };
+  }
+
+  async function runCollection(collection: Collection) {
+    if (!workspace || runningCollection) return;
+    setRunningCollection(true);
+    setError("");
+    const started = performance.now();
+    const ids = new Set([collection.id]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      workspace.collections.forEach((candidate) => {
+        if (candidate.parentId && ids.has(candidate.parentId) && !ids.has(candidate.id)) { ids.add(candidate.id); changed = true; }
+      });
+    }
+    const items: RunItem[] = [];
+    for (const savedRequest of workspace.requests.filter((request) => ids.has(request.collectionId))) {
+      const itemStarted = performance.now();
+      try {
+        let built = buildSavedRequest(savedRequest);
+        if (savedRequest.scriptsEnabled && savedRequest.preRequestScript?.trim()) {
+          const scripted = await runSandboxScript(savedRequest.preRequestScript, { request: built, response: null, variables: variableValues(savedRequest.collectionId) });
+          built = scripted.request as typeof built;
+        }
+        const result = await invoke<ApiResponse>("send_request", { request: { id: crypto.randomUUID(), method: savedRequest.method, ...built, timeout_ms: savedRequest.timeoutMs, follow_redirects: savedRequest.followRedirects } });
+        let tests = assertionResults(savedRequest.assertions ?? [], result);
+        if (savedRequest.scriptsEnabled && savedRequest.postResponseScript?.trim()) {
+          const scripted = await runSandboxScript(savedRequest.postResponseScript, { request: built, response: result, variables: variableValues(savedRequest.collectionId) });
+          tests = [...tests, ...scripted.tests];
+        }
+        items.push({ request_id: savedRequest.id, name: savedRequest.name, method: savedRequest.method, url: result ? built.url : savedRequest.url, status: result.status, elapsed_ms: result.elapsed_ms, tests, error: "" });
+      } catch (runError) {
+        items.push({ request_id: savedRequest.id, name: savedRequest.name, method: savedRequest.method, url: savedRequest.url, status: null, elapsed_ms: Math.round(performance.now() - itemStarted), tests: [], error: String(runError) });
+      }
+    }
+    const passed = items.filter((item) => !item.error && item.tests.every((test) => test.passed)).length;
+    setRunReport({ collection: collectionPath(collection), started_at: new Date().toISOString(), elapsed_ms: Math.round(performance.now() - started), passed, failed: items.length - passed, items });
+    setRunningCollection(false);
+  }
+
+  async function exportRunReport(format: "json" | "junit") {
+    if (!runReport) return;
+    const path = await save({ defaultPath: `api-lantern-report.${format === "junit" ? "xml" : "json"}` });
+    if (!path) return;
+    const escapeXml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    const contents = format === "json" ? JSON.stringify(runReport, null, 2) : `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="${escapeXml(runReport.collection)}" tests="${runReport.items.length}" failures="${runReport.failed}" time="${runReport.elapsed_ms / 1000}">\n${runReport.items.map((item) => `  <testcase name="${escapeXml(item.name)}" classname="${escapeXml(runReport.collection)}" time="${item.elapsed_ms / 1000}">${item.error || item.tests.some((test) => !test.passed) ? `<failure message="${escapeXml(item.error || item.tests.filter((test) => !test.passed).map((test) => test.message).join("; "))}"/>` : ""}</testcase>`).join("\n")}\n</testsuite>\n`;
+    await invoke("save_text_file", { path, contents });
+    setNotice(`Saved ${format.toUpperCase()} report.`);
+  }
+
   function renderCollection(collection: Collection, depth = 0): React.ReactNode {
     const requests = visibleRequests.filter((request) => request.collectionId === collection.id);
     const children = workspace?.collections.filter((item) => item.parentId === collection.id) ?? [];
@@ -675,6 +902,7 @@ function App() {
         <div className="collection-heading">
           <h2><span>⌄</span> {collection.name}</h2>
           <div className="collection-actions">
+            <button type="button" title="Run collection" aria-label={`Run ${collection.name}`} onClick={() => runCollection(collection)}>▶</button>
             <button type="button" title="New nested folder" aria-label={`New folder in ${collection.name}`} onClick={() => createCollection(collection.id)}>+</button>
             <button type="button" title="Rename" aria-label={`Rename ${collection.name}`} onClick={() => renameCollection(collection)}>✎</button>
             {collection.id !== "default" && <button type="button" title="Move folder" aria-label={`Move ${collection.name}`} onClick={() => moveCollection(collection)}>↪</button>}
@@ -900,7 +1128,7 @@ function App() {
           </div>
 
           <div className="panel-tabs" role="tablist" aria-label="Request options" onKeyDown={handleTabKeyDown}>
-            {["Params", "Headers", "Body", "Auth", "Settings"].map((tab) => (
+            {["Params", "Headers", "Body", "Auth", "Scripts", "Tests", "Settings"].map((tab) => (
               <button aria-selected={requestTab === tab} className={requestTab === tab ? "active" : ""} key={tab} onClick={() => setRequestTab(tab)} role="tab" tabIndex={requestTab === tab ? 0 : -1} type="button">
                 {tab}{tab === "Headers" ? ` (${headers.filter((header) => header.enabled).length})` : tab === "Params" ? ` (${params.filter((param) => param.enabled && param.name).length})` : ""}
               </button>
@@ -940,13 +1168,31 @@ function App() {
                 {authType === "api-key" && <><label><span>Key</span><input value={authFields.key} onChange={(event) => updateAuth("key", event.target.value)} /></label><label><span>Value</span><input type="password" value={authFields.value} onChange={(event) => updateAuth("value", event.target.value)} /></label><label><span>Add to</span><select value={authFields.location} onChange={(event) => updateAuth("location", event.target.value)}><option value="header">Header</option><option value="query">Query parameter</option></select></label></>}
               </div>
             )}
+            {requestTab === "Scripts" && <div className="script-editor">
+              <label className="script-toggle"><input checked={scriptsEnabled} onChange={(event) => setScriptsEnabled(event.target.checked)} type="checkbox" /><span>Enable scripts for this request</span></label>
+              <p>Scripts run locally in an isolated worker with network APIs removed and a one-second limit. Imported scripts stay disabled.</p>
+              <label><span>Pre-request JavaScript</span><textarea aria-label="Pre-request JavaScript" value={preRequestScript} onChange={(event) => setPreRequestScript(event.target.value)} placeholder={'request.headers.push({ name: "X-Run", value: "test", enabled: true });'} spellCheck={false} /></label>
+              <label><span>Post-response JavaScript</span><textarea aria-label="Post-response JavaScript" value={postResponseScript} onChange={(event) => setPostResponseScript(event.target.value)} placeholder={'lantern.test("status is 200", () => lantern.expect(response.status).toEqual(200));'} spellCheck={false} /></label>
+            </div>}
+            {requestTab === "Tests" && <div className="assertion-editor">
+              <div className="editor-toolbar"><strong>Friendly assertions</strong><button type="button" onClick={() => setAssertions((current) => [...current, { id: crypto.randomUUID(), kind: "status", operator: "equals", target: "", expected: "200", enabled: true }])}>+ Add assertion</button></div>
+              {assertions.map((assertion) => <div className="assertion-row" key={assertion.id}>
+                <input checked={assertion.enabled} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, enabled: event.target.checked } : item))} type="checkbox" aria-label="Enable assertion" />
+                <select value={assertion.kind} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, kind: event.target.value as RequestAssertion["kind"] } : item))}><option value="status">Status</option><option value="header">Header</option><option value="json-path">JSON path</option><option value="response-time">Response time</option><option value="body">Body</option></select>
+                <input value={assertion.target} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, target: event.target.value } : item))} placeholder={assertion.kind === "header" ? "Header name" : assertion.kind === "json-path" ? "$.data.id" : "Target (optional)"} />
+                <select value={assertion.operator} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, operator: event.target.value as RequestAssertion["operator"] } : item))}><option value="equals">Equals</option><option value="not-equals">Not equals</option><option value="contains">Contains</option><option value="exists">Exists</option><option value="less-than">Less than</option></select>
+                <input value={assertion.expected} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, expected: event.target.value } : item))} placeholder="Expected value" />
+                <button className="row-remove" type="button" onClick={() => setAssertions((current) => current.filter((item) => item.id !== assertion.id))} aria-label="Remove assertion">×</button>
+              </div>)}
+              {!assertions.length && <div className="empty-state">Add assertions for status, headers, JSON paths, body content, or timing.</div>}
+            </div>}
             {requestTab === "Settings" && <div className="settings-grid"><label><span>Timeout (milliseconds)</span><input min="1" type="number" value={timeoutMs} onChange={(event) => setTimeoutMs(Number(event.target.value))} /></label><label className="check-setting"><input checked={followRedirects} onChange={(event) => setFollowRedirects(event.target.checked)} type="checkbox" /><span>Follow redirects (up to 10)</span></label>{workspace && <><label><span>History entries</span><input min="0" type="number" value={workspace.settings.historyLimit} onChange={(event) => { const settings = { ...workspace.settings, historyLimit: Number(event.target.value) }; setWorkspace({ ...workspace, settings }); invoke("save_workspace_settings", { settings }); }} /></label><label><span>Log limit (MB)</span><input min="1" type="number" value={workspace.settings.logLimitMb} onChange={(event) => { const settings = { ...workspace.settings, logLimitMb: Number(event.target.value) }; setWorkspace({ ...workspace, settings }); invoke("save_workspace_settings", { settings }); }} /></label><label className="check-setting"><input checked={workspace.settings.autosave} onChange={(event) => { const settings = { ...workspace.settings, autosave: event.target.checked }; setWorkspace({ ...workspace, settings }); invoke("save_workspace_settings", { settings }); }} type="checkbox" /><span>Autosave saved requests</span></label></>}</div>}
           </div>
         </form>
 
         <section className="response-panel" aria-live="polite">
           <div className="response-heading">
-            <div className="panel-tabs" role="tablist" aria-label="Response details" onKeyDown={handleTabKeyDown}>{["Body", "Headers", "Cookies"].map((tab) => <button aria-selected={responseTab === tab} className={responseTab === tab ? "active" : ""} key={tab} onClick={() => setResponseTab(tab)} role="tab" tabIndex={responseTab === tab ? 0 : -1} type="button">{tab}{tab === "Headers" && response ? ` (${response.headers.length})` : tab === "Cookies" && response ? ` (${cookies.length})` : ""}</button>)}</div>
+            <div className="panel-tabs" role="tablist" aria-label="Response details" onKeyDown={handleTabKeyDown}>{["Body", "Headers", "Cookies", "Tests", "Runner"].map((tab) => <button aria-selected={responseTab === tab} className={responseTab === tab ? "active" : ""} key={tab} onClick={() => setResponseTab(tab)} role="tab" tabIndex={responseTab === tab ? 0 : -1} type="button">{tab}{tab === "Headers" && response ? ` (${response.headers.length})` : tab === "Cookies" && response ? ` (${cookies.length})` : tab === "Tests" && testResults.length ? ` (${testResults.length})` : ""}</button>)}</div>
             {response && <div className="response-meta"><strong className={response.status >= 400 ? "status-error" : ""}>{response.status} {response.status_text}</strong><span>{response.elapsed_ms} ms</span><span>{formatBytes(response.size_bytes)}</span></div>}
           </div>
           {error && <div className="error-box"><strong>Request failed</strong><span>{error}</span></div>}
@@ -954,6 +1200,8 @@ function App() {
           {response && responseTab === "Body" && <><div className="response-tools"><div><button className={responseView === "pretty" ? "active" : ""} onClick={() => setResponseView("pretty")} type="button">Pretty</button><button className={responseView === "raw" ? "active" : ""} onClick={() => setResponseView("raw")} type="button">Raw</button><button className={responseView === "preview" ? "active" : ""} onClick={() => setResponseView("preview")} type="button">Preview</button>{response.content_type.includes("json") && <button className={responseTree ? "active" : ""} onClick={() => setResponseTree((current) => !current)} type="button">Tree</button>}</div><label><input aria-label="Search response" value={responseSearch} onChange={(event) => setResponseSearch(event.target.value)} placeholder="Search response" /><span>{responseSearch ? `${searchMatches} matches` : ""}</span></label><button type="button" onClick={() => navigator.clipboard.writeText(response.body)}>Copy</button><button type="button" onClick={saveResponse}>Save</button></div>{responseView === "preview" ? <div className="response-preview">{response.content_type.startsWith("image/") ? <img src={`data:${response.content_type};base64,${response.body_base64}`} alt="Response preview" /> : response.content_type.includes("html") ? <iframe srcDoc={response.body} sandbox="" title="Response preview" /> : <div className="empty-state">Preview is available for HTML and image responses.</div>}</div> : responseTree ? <JsonTreeBody body={response.body} /> : responseView === "pretty" && response.content_type.includes("json") ? <HighlightedJson body={responseBody} /> : <pre>{responseBody}</pre>}</>}
           {response && responseTab === "Headers" && <div className="response-headers">{response.headers.map((header, index) => <div key={`${header.name}-${index}`}><strong>{header.name}</strong><span>{header.value}</span></div>)}</div>}
           {response && responseTab === "Cookies" && <div className="response-cookies">{cookies.length ? cookies.map((cookie, index) => <div key={`${cookie.name}-${index}`}><strong>{cookie.name}</strong><span>{cookie.value}</span><small>{cookie.attributes || "No attributes"}</small></div>) : <div className="empty-state">This response did not set any cookies.</div>}</div>}
+          {responseTab === "Tests" && <div className="test-results">{testResults.length ? testResults.map((test, index) => <div className={test.passed ? "test-pass" : "test-fail"} key={`${test.name}-${index}`}><strong>{test.passed ? "PASS" : "FAIL"}</strong><span>{test.name}</span><small>{test.message}</small></div>) : <div className="empty-state">Send this request to run its assertions and enabled scripts.</div>}</div>}
+          {responseTab === "Runner" && <div className="runner-results">{runningCollection ? <div className="empty-state">Running collection...</div> : runReport ? <><div className="runner-summary"><strong>{runReport.collection}</strong><span>{runReport.passed} passed · {runReport.failed} failed · {runReport.elapsed_ms} ms</span><button type="button" onClick={() => exportRunReport("json")}>Save JSON</button><button type="button" onClick={() => exportRunReport("junit")}>Save JUnit</button></div>{runReport.items.map((item) => <div className={item.error || item.tests.some((test) => !test.passed) ? "run-fail" : "run-pass"} key={item.request_id}><strong>{item.method} {item.name}</strong><span>{item.status ?? "Error"} · {item.elapsed_ms} ms · {item.tests.filter((test) => test.passed).length}/{item.tests.length} tests</span><small>{item.error}</small></div>)}</> : <div className="empty-state">Use the play button beside a collection to run all of its requests.</div>}</div>}
         </section>
       </section>
       {undoAction && <div className="undo-toast"><span>{undoAction.message}</span><button type="button" onClick={() => undoAction.run().then(() => setUndoAction(null))}>Undo</button><button aria-label="Dismiss undo" type="button" onClick={() => setUndoAction(null)}>×</button></div>}

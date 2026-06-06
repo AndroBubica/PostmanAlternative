@@ -43,6 +43,26 @@ pub struct SavedRequest {
     pub follow_redirects: bool,
     #[serde(default)]
     pub favorite: bool,
+    #[serde(default)]
+    pub pre_request_script: String,
+    #[serde(default)]
+    pub post_response_script: String,
+    #[serde(default)]
+    pub scripts_enabled: bool,
+    #[serde(default)]
+    pub assertions: Vec<RequestAssertion>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestAssertion {
+    pub id: String,
+    pub kind: String,
+    pub operator: String,
+    pub target: String,
+    pub expected: String,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -566,6 +586,10 @@ fn imported_request(
         timeout_ms: 30000,
         follow_redirects: true,
         favorite: false,
+        pre_request_script: String::new(),
+        post_response_script: String::new(),
+        scripts_enabled: false,
+        assertions: vec![],
     }
 }
 
@@ -616,6 +640,23 @@ fn postman_auth(auth: Option<&Value>) -> Option<(String, Value)> {
         "noauth" => Some(("none".into(), json!({}))),
         _ => None,
     }
+}
+
+fn postman_script(item: &Value, event_name: &str) -> String {
+    item.get("event")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|event| event.get("listen").and_then(Value::as_str) == Some(event_name))
+        .and_then(|event| event.pointer("/script/exec").and_then(Value::as_array))
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn import_postman_items(
@@ -766,6 +807,9 @@ fn import_postman_items(
             imported.auth_type = auth_type;
             imported.auth_fields = auth_fields;
         }
+        imported.pre_request_script = postman_script(item, "prerequest");
+        imported.post_response_script = postman_script(item, "test");
+        imported.scripts_enabled = false;
         requests.push(imported);
     }
 }
@@ -1104,6 +1148,30 @@ mod tests {
         assert_eq!(requests[1].auth_fields["token"], "{{token}}");
         assert_eq!(requests[2].auth_type, "none");
         assert_eq!(requests[2].auth_fields, json!({}));
+    }
+
+    #[test]
+    fn postman_scripts_are_imported_but_disabled() {
+        let source = json!([{
+            "name": "Scripted",
+            "event": [
+                {"listen": "prerequest", "script": {"exec": ["lantern.setVariable('run', 'yes');"]}},
+                {"listen": "test", "script": {"exec": ["lantern.test('ok', () => {});"]}}
+            ],
+            "request": {"method": "GET", "url": "https://example.test"}
+        }]);
+        let mut collections = vec![];
+        let mut requests = vec![];
+        import_postman_items(
+            source.as_array().unwrap(),
+            "root",
+            None,
+            &mut collections,
+            &mut requests,
+        );
+        assert!(!requests[0].scripts_enabled);
+        assert!(requests[0].pre_request_script.contains("setVariable"));
+        assert!(requests[0].post_response_script.contains("lantern.test"));
     }
 
     #[test]

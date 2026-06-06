@@ -381,10 +381,12 @@ remain open until the physical platform/device matrix is actually completed.
 
 ### Phase 2: Testing
 
-- Script sandbox
-- Assertions
-- Collection runner
-- CLI and reports
+**Status: Feature complete**
+
+- [x] Sandboxed pre-request and post-response JavaScript with explicit per-request enablement
+- [x] Friendly assertions for status, headers, JSON paths, body content, and timing
+- [x] Nested collection runner with pass/fail results
+- [x] Workspace CLI runner with JSON and JUnit reports
 
 ### Phase 3: Protocols and polish
 

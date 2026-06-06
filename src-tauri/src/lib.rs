@@ -9,7 +9,7 @@ use std::{
 use tokio::sync::oneshot;
 
 mod vault;
-mod workspace;
+pub mod workspace;
 
 #[derive(Default)]
 struct RequestState {
@@ -241,6 +241,13 @@ async fn save_response(path: String, body_base64: String) -> Result<(), String> 
 }
 
 #[tauri::command]
+async fn save_text_file(path: String, contents: String) -> Result<(), String> {
+    tokio::fs::write(&path, contents)
+        .await
+        .map_err(|error| format!("Could not save the report to '{path}'. ({error})"))
+}
+
+#[tauri::command]
 fn cancel_request(request_id: String, state: tauri::State<'_, RequestState>) -> Result<(), String> {
     let sender = state
         .cancellations
@@ -397,6 +404,7 @@ pub fn run() {
             send_request,
             cancel_request,
             save_response,
+            save_text_file,
             load_workspace,
             save_workspace_request,
             delete_workspace_request,

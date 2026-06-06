@@ -12,6 +12,10 @@ It also includes encrypted secrets, multi-request tabs, autosave, scoped
 variables, cURL generation, JSON tree/syntax views, configurable limits,
 shortcuts, undo, and accessible focus/labels.
 
+Phase 2 adds isolated pre-request and post-response JavaScript, friendly
+assertions, nested collection runs, JSON/JUnit reports, and a workspace CLI
+runner. Scripts are disabled by default, including imported Postman scripts.
+
 Workspace data is stored in the operating system's local application-data
 folder. When `portable.flag` exists beside the application, all workspace data
 is stored in a `workspace` folder beside the portable release instead.
@@ -59,6 +63,23 @@ source "$HOME/.cargo/env"
 cd src-tauri
 cargo check
 ```
+
+Run saved workspace requests from a terminal or CI:
+
+```sh
+cd src-tauri
+cargo run --bin api-lantern-cli -- \
+  --workspace /path/to/workspace \
+  --collection collection-id \
+  --environment environment-id \
+  --report junit \
+  --output report.xml
+```
+
+The CLI exits with `1` when a request or assertion fails and `2` for invalid
+usage or report-write errors. It reads the same plain-text workspace files as
+the desktop app. Desktop JavaScript sandbox scripts are reported as unsupported
+by the CLI; use friendly assertions for CI runs.
 
 See [PRODUCT_PLAN.md](PRODUCT_PLAN.md) for the complete product direction and
 roadmap and [RELEASE_NOTES.md](RELEASE_NOTES.md) for the current release
