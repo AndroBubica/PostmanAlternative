@@ -304,7 +304,7 @@ Validation commands passed:
 
 **Status: In progress**
 
-- [ ] Complete request editor and response viewer
+- [x] Complete request editor and response viewer
   - [x] Query parameters and editable headers
   - [x] JSON, text, XML, and form URL encoded bodies
   - [x] Basic, Bearer token, and API key authentication
