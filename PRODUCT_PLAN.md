@@ -260,6 +260,13 @@ Key interaction rules:
 
 ## Phase 1 Implementation Status
 
+**Implementation status: Complete. Verification and cross-platform delivery
+status: In progress.**
+
+All planned Phase 1 product behavior is implemented. Phase 1 cannot be marked
+fully complete until the deferred Windows package and physical-device and
+assistive-technology verification are completed.
+
 - [x] Portable Windows/macOS launchers and shared USB layout generator
 - [ ] Confirm and publish Windows x64 and universal macOS portable packages
   - Universal macOS portable archive built locally on June 6, 2026 and its
@@ -312,8 +319,8 @@ Validated on June 6, 2026:
 - [x] Send one HTTP request through the Rust core
 - [x] Display status, headers, and pretty JSON
 - [ ] Confirm Windows and macOS builds
-  - macOS Apple Silicon application bundle and DMG build successfully.
-  - Windows x64 and universal macOS builds are configured in CI but have not yet been confirmed.
+  - Universal macOS build and portable package are confirmed and published.
+  - Windows x64 publication is deferred.
 - [ ] Prove portable-mode storage beside the executable
   - `portable.flag` ancestor detection and the shared workspace layout are implemented.
   - A local-folder universal macOS portable launch created its workspace beside
@@ -331,7 +338,7 @@ Validation commands passed:
 
 ### Phase 1: MVP
 
-**Status: In progress**
+**Status: Feature complete; verification and Windows delivery in progress**
 
 - [x] Complete request editor and response viewer
   - [x] Query parameters and editable headers
