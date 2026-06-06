@@ -11,6 +11,9 @@ node_modules
 dist
 dist-ssr
 *.local
+/release/
+/API-Lantern-*.zip
+/API-Lantern-*.zip.sha256
 
 # Editor directories and files
 .vscode/*

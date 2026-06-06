@@ -100,9 +100,11 @@ fn describe_request_error(error: reqwest::Error) -> String {
 
 #[tauri::command]
 async fn send_request(
+    app: tauri::AppHandle,
     request: ApiRequest,
     state: tauri::State<'_, RequestState>,
 ) -> Result<ApiResponse, String> {
+    let log_method = request.method.clone();
     let method = Method::from_bytes(request.method.as_bytes())
         .map_err(|_| format!("Unsupported HTTP method: {}", request.method))?;
     let redirect_policy = if request.follow_redirects {
@@ -217,6 +219,14 @@ async fn send_request(
     if let Ok(mut cancellations) = state.cancellations.lock() {
         cancellations.remove(&request_id);
     }
+    let event = match &result {
+        Ok(response) => format!(
+            "request method={} status={} elapsed_ms={} response_bytes={}",
+            log_method, response.status, response.elapsed_ms, response.size_bytes
+        ),
+        Err(_) => format!("request method={} error=request_failed", log_method),
+    };
+    let _ = workspace::append_log(&app, &event);
     result
 }
 

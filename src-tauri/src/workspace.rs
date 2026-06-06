@@ -193,6 +193,7 @@ fn ensure_workspace(root: &Path) -> Result<(), String> {
         "requests",
         "environments",
         "history",
+        "logs",
         "private",
     ] {
         fs::create_dir_all(root.join(directory))
@@ -281,7 +282,11 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 pub fn save_settings(app: &AppHandle, settings: &WorkspaceSettings) -> Result<(), String> {
     let (root, _) = workspace_root(app)?;
     ensure_workspace(&root)?;
-    atomic_json(&root.join("settings.json"), settings)
+    atomic_json(&root.join("settings.json"), settings)?;
+    enforce_log_limit(
+        &root.join("logs"),
+        settings.log_limit_mb.saturating_mul(1024 * 1024),
+    )
 }
 
 pub fn save_globals(app: &AppHandle, variables: &[Variable]) -> Result<(), String> {
@@ -321,6 +326,8 @@ pub fn create_collection(
         parent_id,
         variables: vec![],
     };
+    let collections: Vec<Collection> = read_json_files(&root.join("collections"));
+    validate_collection_parent(&collections, &collection)?;
     atomic_json(
         &root
             .join("collections")
@@ -333,6 +340,8 @@ pub fn create_collection(
 pub fn save_collection(app: &AppHandle, collection: &Collection) -> Result<(), String> {
     let (root, _) = workspace_root(app)?;
     ensure_workspace(&root)?;
+    let collections: Vec<Collection> = read_json_files(&root.join("collections"));
+    validate_collection_parent(&collections, collection)?;
     atomic_json(
         &root
             .join("collections")
@@ -355,6 +364,31 @@ fn collection_descendant_ids(collections: &[Collection], collection_id: &str) ->
         index += 1;
     }
     ids
+}
+
+fn validate_collection_parent(
+    collections: &[Collection],
+    collection: &Collection,
+) -> Result<(), String> {
+    let Some(parent_id) = collection.parent_id.as_deref() else {
+        return Ok(());
+    };
+    if parent_id == collection.id {
+        return Err("A folder cannot be moved into itself.".into());
+    }
+    if !collections
+        .iter()
+        .any(|candidate| candidate.id == parent_id)
+    {
+        return Err("The destination folder no longer exists.".into());
+    }
+    if collection_descendant_ids(collections, &collection.id)
+        .iter()
+        .any(|id| id == parent_id)
+    {
+        return Err("A folder cannot be moved into one of its descendants.".into());
+    }
+    Ok(())
 }
 
 pub fn delete_collection(app: &AppHandle, collection_id: &str) -> Result<(), String> {
@@ -419,6 +453,80 @@ pub fn add_history(app: &AppHandle, entry: &HistoryEntry) -> Result<(), String> 
     Ok(())
 }
 
+fn enforce_log_limit(directory: &Path, limit_bytes: usize) -> Result<(), String> {
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("Could not create log folder. ({error})"))?;
+    let mut files = fs::read_dir(directory)
+        .map_err(|error| format!("Could not read log folder. ({error})"))?
+        .flatten()
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            Some((
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+                metadata.len() as usize,
+                entry.path(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(modified, _, _)| *modified);
+
+    let mut total = files.iter().map(|(_, size, _)| size).sum::<usize>();
+    let remove_count = if limit_bytes == 0 {
+        files.len()
+    } else {
+        files.len().saturating_sub(1)
+    };
+    for (_, size, path) in files.iter().take(remove_count) {
+        if total <= limit_bytes {
+            break;
+        }
+        fs::remove_file(path)
+            .map_err(|error| format!("Could not remove old log file. ({error})"))?;
+        total = total.saturating_sub(*size);
+    }
+
+    if total > limit_bytes && limit_bytes > 0 {
+        if let Some((_, size, path)) = files.last() {
+            if path.exists() && *size > limit_bytes {
+                let bytes = fs::read(path)
+                    .map_err(|error| format!("Could not read active log file. ({error})"))?;
+                let tail = &bytes[bytes.len().saturating_sub(limit_bytes)..];
+                fs::write(path, tail)
+                    .map_err(|error| format!("Could not trim active log file. ({error})"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn append_log(app: &AppHandle, event: &str) -> Result<(), String> {
+    let (root, _) = workspace_root(app)?;
+    ensure_workspace(&root)?;
+    let settings: WorkspaceSettings = read_json(&root.join("settings.json")).unwrap_or_default();
+    let limit_bytes = settings.log_limit_mb.saturating_mul(1024 * 1024);
+    if limit_bytes == 0 {
+        return enforce_log_limit(&root.join("logs"), 0);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = root
+        .join("logs")
+        .join(format!("api-lantern-{}.log", now / 86_400));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("Could not open log file. ({error})"))?;
+    writeln!(file, "{now} {}", event.replace(['\r', '\n'], " "))
+        .map_err(|error| format!("Could not write log file. ({error})"))?;
+    enforce_log_limit(&root.join("logs"), limit_bytes)
+}
+
 fn row(name: &str, value: &str) -> KeyValueRow {
     KeyValueRow {
         id: SystemTime::now()
@@ -461,10 +569,83 @@ fn imported_request(
     }
 }
 
-fn import_postman_items(items: &[Value], collection_id: &str, requests: &mut Vec<SavedRequest>) {
+fn postman_auth(auth: Option<&Value>) -> Option<(String, Value)> {
+    let auth = auth?;
+    let auth_type = auth.get("type").and_then(Value::as_str)?;
+    let values = auth
+        .get(auth_type)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("key")?.as_str()?.to_string(),
+                        entry
+                            .get("value")
+                            .cloned()
+                            .unwrap_or(Value::String(String::new())),
+                    ))
+                })
+                .collect::<serde_json::Map<String, Value>>()
+        })
+        .unwrap_or_default();
+    match auth_type {
+        "basic" => Some((
+            "basic".into(),
+            json!({
+                "username": values.get("username").and_then(Value::as_str).unwrap_or(""),
+                "password": values.get("password").and_then(Value::as_str).unwrap_or("")
+            }),
+        )),
+        "bearer" => Some((
+            "bearer".into(),
+            json!({"token": values.get("token").and_then(Value::as_str).unwrap_or("")}),
+        )),
+        "apikey" => Some((
+            "api-key".into(),
+            json!({
+                "key": values.get("key").and_then(Value::as_str).unwrap_or(""),
+                "value": values.get("value").and_then(Value::as_str).unwrap_or(""),
+                "location": match values.get("in").and_then(Value::as_str) {
+                    Some("query") => "query",
+                    _ => "header"
+                }
+            }),
+        )),
+        "noauth" => Some(("none".into(), json!({}))),
+        _ => None,
+    }
+}
+
+fn import_postman_items(
+    items: &[Value],
+    collection_id: &str,
+    inherited_auth: Option<&(String, Value)>,
+    collections: &mut Vec<Collection>,
+    requests: &mut Vec<SavedRequest>,
+) {
     for item in items {
         if let Some(children) = item.get("item").and_then(Value::as_array) {
-            import_postman_items(children, collection_id, requests);
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Imported folder");
+            let folder = Collection {
+                id: unique_id(&slug(name)),
+                name: name.into(),
+                parent_id: Some(collection_id.into()),
+                variables: vec![],
+            };
+            let folder_auth = postman_auth(item.get("auth")).or_else(|| inherited_auth.cloned());
+            collections.push(folder.clone());
+            import_postman_items(
+                children,
+                &folder.id,
+                folder_auth.as_ref(),
+                collections,
+                requests,
+            );
             continue;
         }
         let Some(request) = item.get("request") else {
@@ -579,14 +760,11 @@ fn import_postman_items(items: &[Value], collection_id: &str, requests: &mut Vec
                 value
             })
             .collect();
-        if let Some(auth) = request.get("auth") {
-            imported.auth_type = match auth.get("type").and_then(Value::as_str) {
-                Some("bearer") => "bearer",
-                Some("basic") => "basic",
-                Some("apikey") => "api-key",
-                _ => "none",
-            }
-            .into();
+        if let Some((auth_type, auth_fields)) =
+            postman_auth(request.get("auth")).or_else(|| inherited_auth.cloned())
+        {
+            imported.auth_type = auth_type;
+            imported.auth_fields = auth_fields;
         }
         requests.push(imported);
     }
@@ -646,8 +824,16 @@ pub fn import_file(app: &AppHandle, path: &str) -> Result<ImportResult, String> 
         .unwrap_or("Imported API");
     let collection = create_collection(app, collection_name, None)?;
     let mut requests = vec![];
+    let mut collections = vec![];
     if let Some(items) = value.get("item").and_then(Value::as_array) {
-        import_postman_items(items, &collection.id, &mut requests);
+        let collection_auth = postman_auth(value.get("auth"));
+        import_postman_items(
+            items,
+            &collection.id,
+            collection_auth.as_ref(),
+            &mut collections,
+            &mut requests,
+        );
     } else if let Some(paths) = value.get("paths").and_then(Value::as_object) {
         let base_url = value
             .pointer("/servers/0/url")
@@ -701,6 +887,9 @@ pub fn import_file(app: &AppHandle, path: &str) -> Result<ImportResult, String> 
         }
     } else {
         return Err("This is not a supported Postman collection, Postman environment, or OpenAPI 3 JSON/YAML file.".into());
+    }
+    for folder in &collections {
+        save_collection(app, folder)?;
     }
     for request in &requests {
         save_request(app, request)?;
@@ -820,11 +1009,101 @@ mod tests {
             }]
         }]);
         let mut requests = vec![];
-        import_postman_items(source.as_array().unwrap(), "users", &mut requests);
+        let mut collections = vec![];
+        import_postman_items(
+            source.as_array().unwrap(),
+            "users",
+            None,
+            &mut collections,
+            &mut requests,
+        );
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].collection_id, "users");
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].parent_id.as_deref(), Some("users"));
+        assert_eq!(requests[0].collection_id, collections[0].id);
         assert_eq!(requests[0].method, "POST");
         assert_eq!(requests[0].headers[0].name, "Accept");
+    }
+
+    #[test]
+    fn postman_auth_values_and_folder_inheritance_are_imported() {
+        let source = json!([{
+            "name": "Secured",
+            "auth": {"type": "apikey", "apikey": [
+                {"key": "key", "value": "X-API-Key"},
+                {"key": "value", "value": "{{apiKey}}"},
+                {"key": "in", "value": "header"}
+            ]},
+            "item": [{
+                "name": "List users",
+                "request": {"method": "GET", "url": "https://example.test/users"}
+            }]
+        }]);
+        let mut collections = vec![];
+        let mut requests = vec![];
+        import_postman_items(
+            source.as_array().unwrap(),
+            "root",
+            None,
+            &mut collections,
+            &mut requests,
+        );
+        assert_eq!(requests[0].auth_type, "api-key");
+        assert_eq!(requests[0].auth_fields["key"], "X-API-Key");
+        assert_eq!(requests[0].auth_fields["value"], "{{apiKey}}");
+        assert_eq!(requests[0].auth_fields["location"], "header");
+    }
+
+    #[test]
+    fn postman_basic_bearer_and_noauth_values_are_imported() {
+        let source = json!([
+            {
+                "name": "Basic",
+                "request": {
+                    "method": "GET",
+                    "url": "https://example.test/basic",
+                    "auth": {"type": "basic", "basic": [
+                        {"key": "username", "value": "ada"},
+                        {"key": "password", "value": "{{password}}"}
+                    ]}
+                }
+            },
+            {
+                "name": "Bearer",
+                "request": {
+                    "method": "GET",
+                    "url": "https://example.test/bearer",
+                    "auth": {"type": "bearer", "bearer": [
+                        {"key": "token", "value": "{{token}}"}
+                    ]}
+                }
+            },
+            {
+                "name": "Public",
+                "request": {
+                    "method": "GET",
+                    "url": "https://example.test/public",
+                    "auth": {"type": "noauth"}
+                }
+            }
+        ]);
+        let inherited = ("bearer".into(), json!({"token": "inherited"}));
+        let mut collections = vec![];
+        let mut requests = vec![];
+        import_postman_items(
+            source.as_array().unwrap(),
+            "root",
+            Some(&inherited),
+            &mut collections,
+            &mut requests,
+        );
+        assert_eq!(requests[0].auth_type, "basic");
+        assert_eq!(requests[0].auth_fields["username"], "ada");
+        assert_eq!(requests[0].auth_fields["password"], "{{password}}");
+        assert_eq!(requests[1].auth_type, "bearer");
+        assert_eq!(requests[1].auth_fields["token"], "{{token}}");
+        assert_eq!(requests[2].auth_type, "none");
+        assert_eq!(requests[2].auth_fields, json!({}));
     }
 
     #[test]
@@ -881,5 +1160,45 @@ mod tests {
             collection_descendant_ids(&collections, "root"),
             vec!["root", "child", "grandchild"]
         );
+    }
+
+    #[test]
+    fn collection_parent_validation_rejects_descendant_cycles() {
+        let collections = vec![
+            Collection {
+                id: "root".into(),
+                name: "Root".into(),
+                parent_id: None,
+                variables: vec![],
+            },
+            Collection {
+                id: "child".into(),
+                name: "Child".into(),
+                parent_id: Some("root".into()),
+                variables: vec![],
+            },
+        ];
+        let moved = Collection {
+            parent_id: Some("child".into()),
+            ..collections[0].clone()
+        };
+        assert!(validate_collection_parent(&collections, &moved).is_err());
+    }
+
+    #[test]
+    fn log_limit_removes_old_files_and_trims_active_file() {
+        let directory = std::env::temp_dir().join(unique_id("api-lantern-log-test"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("old.log"), vec![b'a'; 8]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(directory.join("new.log"), vec![b'b'; 8]).unwrap();
+        enforce_log_limit(&directory, 10).unwrap();
+        let total = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        assert!(total <= 10);
+        let _ = fs::remove_dir_all(directory);
     }
 }

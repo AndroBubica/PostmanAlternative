@@ -588,6 +588,46 @@ function App() {
     await refreshWorkspace();
   }
 
+  function collectionPath(collection: Collection) {
+    const names = [collection.name];
+    let parentId = collection.parentId;
+    while (parentId) {
+      const parent = workspace?.collections.find((item) => item.id === parentId);
+      if (!parent) break;
+      names.unshift(parent.name);
+      parentId = parent.parentId;
+    }
+    return names.join(" / ");
+  }
+
+  async function moveCollection(collection: Collection) {
+    if (!workspace || collection.id === "default") return;
+    const descendantIds = new Set<string>([collection.id]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      workspace.collections.forEach((candidate) => {
+        if (candidate.parentId && descendantIds.has(candidate.parentId) && !descendantIds.has(candidate.id)) {
+          descendantIds.add(candidate.id);
+          changed = true;
+        }
+      });
+    }
+    const destinations = workspace.collections.filter((candidate) => !descendantIds.has(candidate.id));
+    const choices = ["Top level", ...destinations.map(collectionPath)];
+    const answer = window.prompt(`Move "${collection.name}" to:\n${choices.map((choice, index) => `${index}: ${choice}`).join("\n")}`, "0");
+    if (answer === null) return;
+    const index = Number(answer);
+    if (!Number.isInteger(index) || index < 0 || index >= choices.length) {
+      setError("Choose a destination number from the move-folder list.");
+      return;
+    }
+    const parentId = index === 0 ? undefined : destinations[index - 1].id;
+    await invoke("save_workspace_collection", { collection: { ...collection, parentId } });
+    setNotice(`Moved "${collection.name}" to ${choices[index]}.`);
+    await refreshWorkspace();
+  }
+
   async function deleteCollection(collection: Collection) {
     if (!window.confirm(`Delete "${collection.name}" and every request and folder inside it?`)) return;
     await invoke("delete_workspace_collection", { collectionId: collection.id });
@@ -637,6 +677,7 @@ function App() {
           <div className="collection-actions">
             <button type="button" title="New nested folder" aria-label={`New folder in ${collection.name}`} onClick={() => createCollection(collection.id)}>+</button>
             <button type="button" title="Rename" aria-label={`Rename ${collection.name}`} onClick={() => renameCollection(collection)}>✎</button>
+            {collection.id !== "default" && <button type="button" title="Move folder" aria-label={`Move ${collection.name}`} onClick={() => moveCollection(collection)}>↪</button>}
             {collection.id !== "default" && <button type="button" title="Delete" aria-label={`Delete ${collection.name}`} onClick={() => deleteCollection(collection)}>×</button>}
           </div>
         </div>
@@ -786,13 +827,28 @@ function App() {
     );
   }
 
+  function handleTabKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+    const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    if (current < 0 || !tabs.length) return;
+    event.preventDefault();
+    const next = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? tabs.length - 1
+        : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[next].focus();
+    tabs[next].click();
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="brand"><span className="brand-mark">A</span><strong>API Lantern</strong><span className="local-pill">{workspace?.portable ? "Portable" : "Local only"}</span></div>
         <div className="top-actions">
           {pendingWrites > 0 && <span className="notice" role="status">Writing to disk...</span>}
-          {pendingWrites === 0 && notice && <span className="notice">{notice}</span>}
+          {pendingWrites === 0 && notice && <span className="notice" role="status">{notice}</span>}
           <button type="button" onClick={importFile}>Import</button>
           <button type="button" onClick={importCurl}>cURL</button>
           <button type="button" onClick={generateCurl}>Copy cURL</button>
@@ -830,7 +886,7 @@ function App() {
       </aside>
 
       <section className="workspace">
-        <div className="request-tabs">{openTabs.length ? openTabs.map((tab) => <button className={`open-tab ${tab.key === activeTabKey ? "active" : ""}`} onClick={() => switchTab(tab)} key={tab.key} type="button"><span className={methodColors[tab.key === activeTabKey ? method : tab.request.method]}>{tab.key === activeTabKey ? method : tab.request.method}</span>{tab.key === activeTabKey ? requestName : tab.request.name}{tab.key === activeTabKey && !saved && <span className="unsaved-dot" aria-label="Unsaved changes" />}<span className="tab-close" role="button" aria-label={`Close ${tab.request.name}`} onClick={(event) => { event.stopPropagation(); closeTab(tab.key); }}>×</span></button>) : <button className="open-tab active" type="button"><span className={methodColors[method]}>{method}</span>{requestName}{!saved && <span className="unsaved-dot" aria-label="Unsaved changes" />}</button>}<button className="tab-add" onClick={newRequest} type="button" aria-label="New tab">+</button></div>
+        <div className="request-tabs" role="tablist" aria-label="Open requests" onKeyDown={handleTabKeyDown}>{openTabs.length ? openTabs.map((tab) => <div className={`open-tab ${tab.key === activeTabKey ? "active" : ""}`} key={tab.key} role="presentation"><button aria-selected={tab.key === activeTabKey} className="tab-select" onClick={() => switchTab(tab)} role="tab" tabIndex={tab.key === activeTabKey ? 0 : -1} type="button"><span className={methodColors[tab.key === activeTabKey ? method : tab.request.method]}>{tab.key === activeTabKey ? method : tab.request.method}</span>{tab.key === activeTabKey ? requestName : tab.request.name}{tab.key === activeTabKey && !saved && <span className="unsaved-dot" aria-label="Unsaved changes" />}</button><button className="tab-close" aria-label={`Close ${tab.request.name}`} onClick={() => closeTab(tab.key)} type="button">×</button></div>) : <div className="open-tab active" role="presentation"><button aria-selected="true" className="tab-select" role="tab" tabIndex={0} type="button"><span className={methodColors[method]}>{method}</span>{requestName}{!saved && <span className="unsaved-dot" aria-label="Unsaved changes" />}</button></div>}<button className="tab-add" onClick={newRequest} type="button" aria-label="New tab">+</button></div>
 
         <form className="request-panel" onSubmit={sendRequest}>
           <div className="request-line">
@@ -843,9 +899,9 @@ function App() {
             {sending ? <button className="cancel-button" onClick={cancelRequest} type="button">Cancel</button> : <button className="send-button" type="submit">Send</button>}
           </div>
 
-          <div className="panel-tabs" role="tablist" aria-label="Request options">
+          <div className="panel-tabs" role="tablist" aria-label="Request options" onKeyDown={handleTabKeyDown}>
             {["Params", "Headers", "Body", "Auth", "Settings"].map((tab) => (
-              <button className={requestTab === tab ? "active" : ""} key={tab} onClick={() => setRequestTab(tab)} role="tab" type="button">
+              <button aria-selected={requestTab === tab} className={requestTab === tab ? "active" : ""} key={tab} onClick={() => setRequestTab(tab)} role="tab" tabIndex={requestTab === tab ? 0 : -1} type="button">
                 {tab}{tab === "Headers" ? ` (${headers.filter((header) => header.enabled).length})` : tab === "Params" ? ` (${params.filter((param) => param.enabled && param.name).length})` : ""}
               </button>
             ))}
@@ -873,7 +929,7 @@ function App() {
                   <button className="add-row" type="button" onClick={() => setMultipartRows((current) => [...current, emptyMultipartRow()])}>+ Add field</button>
                 </div>}
                 {bodyMode === "binary" && <div className="file-body"><strong>Binary file</strong><span>{binaryFile || "No file selected."}</span><button className="file-picker" type="button" onClick={() => chooseFile(setBinaryFile)}>{binaryFile ? "Choose another file" : "Choose file..."}</button></div>}
-                {!["form", "multipart", "binary"].includes(bodyMode) && <textarea value={body} onChange={(event) => setBody(event.target.value)} spellCheck={false} />}
+                {!["form", "multipart", "binary"].includes(bodyMode) && <textarea aria-label={`${bodyMode} request body`} value={body} onChange={(event) => setBody(event.target.value)} spellCheck={false} />}
               </>
             )}
             {requestTab === "Auth" && (
@@ -890,12 +946,12 @@ function App() {
 
         <section className="response-panel" aria-live="polite">
           <div className="response-heading">
-            <div className="panel-tabs" role="tablist" aria-label="Response details">{["Body", "Headers", "Cookies"].map((tab) => <button className={responseTab === tab ? "active" : ""} key={tab} onClick={() => setResponseTab(tab)} role="tab" type="button">{tab}{tab === "Headers" && response ? ` (${response.headers.length})` : tab === "Cookies" && response ? ` (${cookies.length})` : ""}</button>)}</div>
+            <div className="panel-tabs" role="tablist" aria-label="Response details" onKeyDown={handleTabKeyDown}>{["Body", "Headers", "Cookies"].map((tab) => <button aria-selected={responseTab === tab} className={responseTab === tab ? "active" : ""} key={tab} onClick={() => setResponseTab(tab)} role="tab" tabIndex={responseTab === tab ? 0 : -1} type="button">{tab}{tab === "Headers" && response ? ` (${response.headers.length})` : tab === "Cookies" && response ? ` (${cookies.length})` : ""}</button>)}</div>
             {response && <div className="response-meta"><strong className={response.status >= 400 ? "status-error" : ""}>{response.status} {response.status_text}</strong><span>{response.elapsed_ms} ms</span><span>{formatBytes(response.size_bytes)}</span></div>}
           </div>
           {error && <div className="error-box"><strong>Request failed</strong><span>{error}</span></div>}
           {!response && !error && <div className="empty-response">Send a request to see the response.</div>}
-          {response && responseTab === "Body" && <><div className="response-tools"><div><button className={responseView === "pretty" ? "active" : ""} onClick={() => setResponseView("pretty")} type="button">Pretty</button><button className={responseView === "raw" ? "active" : ""} onClick={() => setResponseView("raw")} type="button">Raw</button><button className={responseView === "preview" ? "active" : ""} onClick={() => setResponseView("preview")} type="button">Preview</button>{response.content_type.includes("json") && <button className={responseTree ? "active" : ""} onClick={() => setResponseTree((current) => !current)} type="button">Tree</button>}</div><label><input value={responseSearch} onChange={(event) => setResponseSearch(event.target.value)} placeholder="Search response" /><span>{responseSearch ? `${searchMatches} matches` : ""}</span></label><button type="button" onClick={() => navigator.clipboard.writeText(response.body)}>Copy</button><button type="button" onClick={saveResponse}>Save</button></div>{responseView === "preview" ? <div className="response-preview">{response.content_type.startsWith("image/") ? <img src={`data:${response.content_type};base64,${response.body_base64}`} alt="Response preview" /> : response.content_type.includes("html") ? <iframe srcDoc={response.body} sandbox="" title="Response preview" /> : <div className="empty-state">Preview is available for HTML and image responses.</div>}</div> : responseTree ? <JsonTreeBody body={response.body} /> : responseView === "pretty" && response.content_type.includes("json") ? <HighlightedJson body={responseBody} /> : <pre>{responseBody}</pre>}</>}
+          {response && responseTab === "Body" && <><div className="response-tools"><div><button className={responseView === "pretty" ? "active" : ""} onClick={() => setResponseView("pretty")} type="button">Pretty</button><button className={responseView === "raw" ? "active" : ""} onClick={() => setResponseView("raw")} type="button">Raw</button><button className={responseView === "preview" ? "active" : ""} onClick={() => setResponseView("preview")} type="button">Preview</button>{response.content_type.includes("json") && <button className={responseTree ? "active" : ""} onClick={() => setResponseTree((current) => !current)} type="button">Tree</button>}</div><label><input aria-label="Search response" value={responseSearch} onChange={(event) => setResponseSearch(event.target.value)} placeholder="Search response" /><span>{responseSearch ? `${searchMatches} matches` : ""}</span></label><button type="button" onClick={() => navigator.clipboard.writeText(response.body)}>Copy</button><button type="button" onClick={saveResponse}>Save</button></div>{responseView === "preview" ? <div className="response-preview">{response.content_type.startsWith("image/") ? <img src={`data:${response.content_type};base64,${response.body_base64}`} alt="Response preview" /> : response.content_type.includes("html") ? <iframe srcDoc={response.body} sandbox="" title="Response preview" /> : <div className="empty-state">Preview is available for HTML and image responses.</div>}</div> : responseTree ? <JsonTreeBody body={response.body} /> : responseView === "pretty" && response.content_type.includes("json") ? <HighlightedJson body={responseBody} /> : <pre>{responseBody}</pre>}</>}
           {response && responseTab === "Headers" && <div className="response-headers">{response.headers.map((header, index) => <div key={`${header.name}-${index}`}><strong>{header.name}</strong><span>{header.value}</span></div>)}</div>}
           {response && responseTab === "Cookies" && <div className="response-cookies">{cookies.length ? cookies.map((cookie, index) => <div key={`${cookie.name}-${index}`}><strong>{cookie.name}</strong><span>{cookie.value}</span><small>{cookie.attributes || "No attributes"}</small></div>) : <div className="empty-state">This response did not set any cookies.</div>}</div>}
         </section>

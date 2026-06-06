@@ -262,16 +262,21 @@ Key interaction rules:
 
 - [x] Portable Windows/macOS launchers and shared USB layout generator
 - [ ] Confirm and publish Windows x64 and universal macOS portable packages
+  - Universal macOS portable archive built locally on June 6, 2026 and its
+    executable verified as `x86_64 arm64`.
+  - CI now verifies archive checksums/layouts and launch-smoke-tests portable
+    workspace creation before upload.
+  - Windows x64 build and publication still require running the release workflow.
 - [x] AES-256-GCM encrypted secret vault with Argon2 password derivation
 - [x] Multi-request tabs, autosave, and unsaved-exit warning
 - [x] Global, collection, environment, and temporary variables with source explanations
 - [x] cURL import/generation and URL variable highlighting
 - [x] JSON tree viewer and syntax highlighting
 - [x] OpenAPI JSON/YAML and Postman collection/environment imports
-- [ ] Preserve imported Postman folder hierarchy and complete authentication values
+- [x] Preserve imported Postman folder hierarchy and complete authentication values
 - [x] Documented standalone workspace export format
 - [x] Configurable history limit and log-limit setting
-- [ ] Implement log retention and enforce the configured log-size limit
+- [x] Implement log retention and enforce the configured log-size limit
 - [x] Keyboard shortcuts, destructive-action undo, labels, and visible focus
 - [ ] Complete hands-on accessibility verification
 
@@ -309,6 +314,8 @@ Validated on June 6, 2026:
   - Windows x64 and universal macOS builds are configured in CI but have not yet been confirmed.
 - [ ] Prove portable-mode storage beside the executable
   - `portable.flag` ancestor detection and the shared workspace layout are implemented.
+  - A local-folder universal macOS portable launch created its workspace beside
+    the application on June 6, 2026.
   - Physical USB testing on Windows and macOS is still required.
 
 Validation commands passed:
@@ -317,6 +324,8 @@ Validation commands passed:
 - `cargo check`
 - `cargo test`
 - `corepack pnpm tauri build --bundles app`
+- `actionlint .github/workflows/release.yml`
+- `corepack pnpm tauri build --target universal-apple-darwin --bundles app`
 
 ### Phase 1: MVP
 
@@ -341,19 +350,23 @@ Validation commands passed:
 - [x] Portable launchers and shared USB folder layout generator
 - [x] Encrypted secret vault
 - [x] Nested collection folders, rename, duplicate, request move, delete, and favorites
-- [ ] Move collection folders between parents
+- [x] Move collection folders between parents
 - [x] Real multi-request tabs and autosave
 - [x] Global, collection, and temporary variable scopes with source explanations
 - [x] cURL generation and URL variable highlighting
 - [x] JSON tree viewer and syntax highlighting
-- [ ] Preserve Postman folder hierarchy and import complete authentication values
+- [x] Preserve Postman folder hierarchy and import complete authentication values
 - [x] OpenAPI JSON/YAML and broader Postman body/query/header import
 - [x] Documented standalone workspace export format
-- [ ] Implement log files and enforce the configured log-size limit
+- [x] Implement log files and enforce the configured log-size limit
 - [x] Configurable history limit and pending-write exit warning
 - [x] Keyboard shortcuts and destructive-action undo
 - [ ] Complete hands-on keyboard, screen-reader, and contrast accessibility verification
 - [ ] Test portable mode on physical Windows and macOS machines/USB media
+
+Environment-dependent verification is documented in
+`ACCESSIBILITY_VERIFICATION.md` and `PORTABLE_TEST_PLAN.md`. These items must
+remain open until the physical platform/device matrix is actually completed.
 
 ### Phase 2: Testing
 
