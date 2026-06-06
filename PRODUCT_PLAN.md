@@ -311,7 +311,7 @@ Validation commands passed:
   - [x] Request timeout, redirect control, and cancellation
   - [x] Pretty/raw response body, response search, copy, headers, and metadata
   - [x] Multipart and binary request bodies
-  - [ ] Response preview, cookies, and save to file
+  - [x] Response preview, cookies, and save to file
 - Collections, folders, history, variables, environments
 - Plain-text workspace format
 - cURL and Postman import

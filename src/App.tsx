@@ -1,6 +1,6 @@
 import { FormEvent, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 type KeyValueRow = {
@@ -17,11 +17,13 @@ type ApiResponse = {
   size_bytes: number;
   headers: Array<{ name: string; value: string }>;
   body: string;
+  body_base64: string;
+  content_type: string;
 };
 
 type AuthType = "none" | "basic" | "bearer" | "api-key";
 type BodyMode = "json" | "text" | "xml" | "form" | "multipart" | "binary";
-type ResponseView = "pretty" | "raw";
+type ResponseView = "pretty" | "raw" | "preview";
 type MultipartRow = KeyValueRow & { kind: "text" | "file" };
 
 const methodColors: Record<string, string> = {
@@ -68,6 +70,32 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function parseCookies(headers: ApiResponse["headers"]) {
+  return headers
+    .filter((header) => header.name.toLowerCase() === "set-cookie")
+    .map((header) => {
+      const [pair, ...attributes] = header.value.split(";").map((part) => part.trim());
+      const separator = pair.indexOf("=");
+      return {
+        name: separator >= 0 ? pair.slice(0, separator) : pair,
+        value: separator >= 0 ? pair.slice(separator + 1) : "",
+        attributes: attributes.join("; "),
+      };
+    });
+}
+
+function responseExtension(contentType: string) {
+  if (contentType.includes("json")) return "json";
+  if (contentType.includes("html")) return "html";
+  if (contentType.includes("xml")) return "xml";
+  if (contentType.includes("png")) return "png";
+  if (contentType.includes("jpeg")) return "jpg";
+  if (contentType.includes("gif")) return "gif";
+  if (contentType.includes("svg")) return "svg";
+  if (contentType.startsWith("text/")) return "txt";
+  return "bin";
 }
 
 function KeyValueTable({
@@ -159,6 +187,7 @@ function App() {
     if (!responseSearch) return 0;
     return responseBody.toLowerCase().split(responseSearch.toLowerCase()).length - 1;
   }, [responseBody, responseSearch]);
+  const cookies = useMemo(() => (response ? parseCookies(response.headers) : []), [response]);
 
   function buildRequest() {
     const requestUrl = new URL(url);
@@ -251,6 +280,16 @@ function App() {
     if (selected) onSelected(selected);
   }
 
+  async function saveResponse() {
+    if (!response) return;
+    const path = await save({
+      defaultPath: `response.${responseExtension(response.content_type)}`,
+    });
+    if (path) {
+      await invoke("save_response", { path, bodyBase64: response.body_base64 });
+    }
+  }
+
   function updateMultipartRow(id: number, field: keyof MultipartRow, value: string | boolean) {
     setMultipartRows((current) =>
       current.map((row) => (row.id === id ? { ...row, [field]: value } : row)),
@@ -336,13 +375,14 @@ function App() {
 
         <section className="response-panel" aria-live="polite">
           <div className="response-heading">
-            <div className="panel-tabs" role="tablist" aria-label="Response details">{["Body", "Headers"].map((tab) => <button className={responseTab === tab ? "active" : ""} key={tab} onClick={() => setResponseTab(tab)} role="tab" type="button">{tab}{tab === "Headers" && response ? ` (${response.headers.length})` : ""}</button>)}</div>
+            <div className="panel-tabs" role="tablist" aria-label="Response details">{["Body", "Headers", "Cookies"].map((tab) => <button className={responseTab === tab ? "active" : ""} key={tab} onClick={() => setResponseTab(tab)} role="tab" type="button">{tab}{tab === "Headers" && response ? ` (${response.headers.length})` : tab === "Cookies" && response ? ` (${cookies.length})` : ""}</button>)}</div>
             {response && <div className="response-meta"><strong className={response.status >= 400 ? "status-error" : ""}>{response.status} {response.status_text}</strong><span>{response.elapsed_ms} ms</span><span>{formatBytes(response.size_bytes)}</span></div>}
           </div>
           {error && <div className="error-box"><strong>Request failed</strong><span>{error}</span></div>}
           {!response && !error && <div className="empty-response">Send a request to see the response.</div>}
-          {response && responseTab === "Body" && <><div className="response-tools"><div><button className={responseView === "pretty" ? "active" : ""} onClick={() => setResponseView("pretty")} type="button">Pretty</button><button className={responseView === "raw" ? "active" : ""} onClick={() => setResponseView("raw")} type="button">Raw</button></div><label><input value={responseSearch} onChange={(event) => setResponseSearch(event.target.value)} placeholder="Search response" /><span>{responseSearch ? `${searchMatches} matches` : ""}</span></label><button type="button" onClick={() => navigator.clipboard.writeText(response.body)}>Copy</button></div><pre>{responseBody}</pre></>}
+          {response && responseTab === "Body" && <><div className="response-tools"><div><button className={responseView === "pretty" ? "active" : ""} onClick={() => setResponseView("pretty")} type="button">Pretty</button><button className={responseView === "raw" ? "active" : ""} onClick={() => setResponseView("raw")} type="button">Raw</button><button className={responseView === "preview" ? "active" : ""} onClick={() => setResponseView("preview")} type="button">Preview</button></div><label><input value={responseSearch} onChange={(event) => setResponseSearch(event.target.value)} placeholder="Search response" /><span>{responseSearch ? `${searchMatches} matches` : ""}</span></label><button type="button" onClick={() => navigator.clipboard.writeText(response.body)}>Copy</button><button type="button" onClick={saveResponse}>Save</button></div>{responseView === "preview" ? <div className="response-preview">{response.content_type.startsWith("image/") ? <img src={`data:${response.content_type};base64,${response.body_base64}`} alt="Response preview" /> : response.content_type.includes("html") ? <iframe srcDoc={response.body} sandbox="" title="Response preview" /> : <div className="empty-state">Preview is available for HTML and image responses.</div>}</div> : <pre>{responseBody}</pre>}</>}
           {response && responseTab === "Headers" && <div className="response-headers">{response.headers.map((header, index) => <div key={`${header.name}-${index}`}><strong>{header.name}</strong><span>{header.value}</span></div>)}</div>}
+          {response && responseTab === "Cookies" && <div className="response-cookies">{cookies.length ? cookies.map((cookie, index) => <div key={`${cookie.name}-${index}`}><strong>{cookie.name}</strong><span>{cookie.value}</span><small>{cookie.attributes || "No attributes"}</small></div>) : <div className="empty-state">This response did not set any cookies.</div>}</div>}
         </section>
       </section>
     </main>

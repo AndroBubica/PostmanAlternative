@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::{header::HeaderName, multipart, Method};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -70,6 +71,8 @@ struct ApiResponse {
     size_bytes: usize,
     headers: Vec<ResponseHeader>,
     body: String,
+    body_base64: String,
+    content_type: String,
 }
 
 fn describe_request_error(error: reqwest::Error) -> String {
@@ -169,6 +172,12 @@ async fn send_request(
     let request_future = async {
         let response = builder.send().await.map_err(describe_request_error)?;
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
         let headers = response
             .headers()
             .iter()
@@ -177,15 +186,19 @@ async fn send_request(
                 value: value.to_str().unwrap_or("<binary value>").to_string(),
             })
             .collect();
-        let body = response.text().await.map_err(describe_request_error)?;
+        let bytes = response.bytes().await.map_err(describe_request_error)?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let body_base64 = BASE64.encode(&bytes);
 
         Ok(ApiResponse {
             status: status.as_u16(),
             status_text: status.canonical_reason().unwrap_or("Unknown").to_string(),
             elapsed_ms: started.elapsed().as_millis(),
-            size_bytes: body.len(),
+            size_bytes: bytes.len(),
             headers,
             body,
+            body_base64,
+            content_type,
         })
     };
     let result = tokio::select! {
@@ -197,6 +210,16 @@ async fn send_request(
         cancellations.remove(&request_id);
     }
     result
+}
+
+#[tauri::command]
+async fn save_response(path: String, body_base64: String) -> Result<(), String> {
+    let bytes = BASE64
+        .decode(body_base64)
+        .map_err(|error| format!("Could not decode the response body. ({error})"))?;
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|error| format!("Could not save the response to '{path}'. ({error})"))
 }
 
 #[tauri::command]
@@ -218,7 +241,11 @@ pub fn run() {
         .manage(RequestState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![send_request, cancel_request])
+        .invoke_handler(tauri::generate_handler![
+            send_request,
+            cancel_request,
+            save_response
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

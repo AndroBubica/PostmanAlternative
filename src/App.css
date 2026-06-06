@@ -188,6 +188,16 @@ textarea {
 .response-headers { padding: 9px 18px; }
 .response-headers div { display: grid; grid-template-columns: 220px 1fr; padding: 6px 0; color: #9eabb5; font-size: 11px; }
 .response-headers strong { color: #cbd4db; }
+.response-preview { display: grid; min-height: 220px; place-items: center; padding: 14px; }
+.response-preview img { max-width: 100%; max-height: 420px; object-fit: contain; }
+.response-preview iframe { width: 100%; min-height: 360px; border: 1px solid #303840; border-radius: 4px; background: #fff; }
+.response-cookies { padding: 9px 18px; }
+.response-cookies > div:not(.empty-state) {
+  display: grid; grid-template-columns: 180px minmax(180px, 1fr) 2fr; gap: 14px; padding: 7px 0;
+  border-bottom: 1px solid #242b31; color: #9eabb5; font-size: 11px;
+}
+.response-cookies strong { color: #cbd4db; }
+.response-cookies small { color: #77838d; overflow-wrap: anywhere; }
 .error-box {
   display: flex; flex-direction: column; gap: 6px; margin: 16px; padding: 13px;
   border: 1px solid #603438; border-radius: 6px; color: #d8999d; background: #28191b; font-size: 12px;
