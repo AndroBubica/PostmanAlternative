@@ -1,4 +1,4 @@
-use reqwest::{header::HeaderName, Method};
+use reqwest::{header::HeaderName, multipart, Method};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -20,12 +20,38 @@ struct RequestHeader {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MultipartFieldKind {
+    Text,
+    File,
+}
+
+#[derive(Deserialize)]
+struct MultipartField {
+    name: String,
+    value: String,
+    enabled: bool,
+    kind: MultipartFieldKind,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RequestBodyKind {
+    Text,
+    Multipart,
+    Binary,
+}
+
+#[derive(Deserialize)]
 struct ApiRequest {
     id: String,
     method: String,
     url: String,
     headers: Vec<RequestHeader>,
+    body_kind: RequestBodyKind,
     body: Option<String>,
+    multipart_fields: Vec<MultipartField>,
+    binary_file: Option<String>,
     timeout_ms: u64,
     follow_redirects: bool,
 }
@@ -85,9 +111,49 @@ async fn send_request(
             .map_err(|_| format!("Invalid header name: {}", header.name))?;
         builder = builder.header(name, header.value);
     }
-    if let Some(body) = request.body {
-        if !body.is_empty() {
-            builder = builder.body(body);
+    match request.body_kind {
+        RequestBodyKind::Multipart => {
+            let mut form = multipart::Form::new();
+            for field in request
+                .multipart_fields
+                .into_iter()
+                .filter(|field| field.enabled && !field.name.is_empty())
+            {
+                form = match field.kind {
+                    MultipartFieldKind::Text => form.text(field.name, field.value),
+                    MultipartFieldKind::File => {
+                        let bytes = tokio::fs::read(&field.value).await.map_err(|error| {
+                            format!("Could not read multipart file '{}'. ({error})", field.value)
+                        })?;
+                        let file_name = std::path::Path::new(&field.value)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("file")
+                            .to_string();
+                        form.part(
+                            field.name,
+                            multipart::Part::bytes(bytes).file_name(file_name),
+                        )
+                    }
+                };
+            }
+            builder = builder.multipart(form);
+        }
+        RequestBodyKind::Binary => {
+            let path = request
+                .binary_file
+                .ok_or_else(|| "Choose a binary file before sending the request.".to_string())?;
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| format!("Could not read binary file '{path}'. ({error})"))?;
+            builder = builder.body(bytes);
+        }
+        RequestBodyKind::Text => {
+            if let Some(body) = request.body {
+                if !body.is_empty() {
+                    builder = builder.body(body);
+                }
+            }
         }
     }
 
@@ -150,6 +216,7 @@ fn cancel_request(request_id: String, state: tauri::State<'_, RequestState>) -> 
 pub fn run() {
     tauri::Builder::default()
         .manage(RequestState::default())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![send_request, cancel_request])
         .run(tauri::generate_context!())

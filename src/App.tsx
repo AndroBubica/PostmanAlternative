@@ -1,5 +1,6 @@
 import { FormEvent, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 type KeyValueRow = {
@@ -19,8 +20,9 @@ type ApiResponse = {
 };
 
 type AuthType = "none" | "basic" | "bearer" | "api-key";
-type BodyMode = "json" | "text" | "xml" | "form";
+type BodyMode = "json" | "text" | "xml" | "form" | "multipart" | "binary";
 type ResponseView = "pretty" | "raw";
+type MultipartRow = KeyValueRow & { kind: "text" | "file" };
 
 const methodColors: Record<string, string> = {
   GET: "method-get",
@@ -47,6 +49,12 @@ const emptyRow = (): KeyValueRow => ({
   value: "",
   enabled: true,
 });
+
+const emptyMultipartRow = (): MultipartRow => ({ ...emptyRow(), kind: "text" });
+
+function fileName(path: string) {
+  return path.split(/[\\/]/).pop() || path;
+}
 
 function prettyBody(body: string) {
   try {
@@ -123,6 +131,8 @@ function App() {
   const [body, setBody] = useState('{\n  "name": "Ada",\n  "role": "developer"\n}');
   const [bodyMode, setBodyMode] = useState<BodyMode>("json");
   const [formRows, setFormRows] = useState<KeyValueRow[]>([emptyRow()]);
+  const [multipartRows, setMultipartRows] = useState<MultipartRow[]>([emptyMultipartRow()]);
+  const [binaryFile, setBinaryFile] = useState("");
   const [params, setParams] = useState<KeyValueRow[]>([emptyRow()]);
   const [headers, setHeaders] = useState<KeyValueRow[]>([
     { id: 1, name: "Accept", value: "application/json", enabled: true },
@@ -154,15 +164,21 @@ function App() {
     const requestUrl = new URL(url);
     params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(row.name, row.value));
     const requestHeaders = headers.map((header) => ({ ...header }));
-    const contentTypes: Record<BodyMode, string> = {
+    const contentTypes: Partial<Record<BodyMode, string>> = {
       json: "application/json",
       text: "text/plain",
       xml: "application/xml",
       form: "application/x-www-form-urlencoded",
+      binary: "application/octet-stream",
     };
     const contentType = requestHeaders.find((header) => header.name.toLowerCase() === "content-type");
-    if (contentType) contentType.value = contentTypes[bodyMode];
-    else requestHeaders.push({ id: -2, name: "Content-Type", value: contentTypes[bodyMode], enabled: true });
+    if (bodyMode === "multipart") {
+      if (contentType) contentType.enabled = false;
+    } else {
+      const value = contentTypes[bodyMode];
+      if (value && contentType) contentType.value = value;
+      else if (value) requestHeaders.push({ id: -2, name: "Content-Type", value, enabled: true });
+    }
 
     if (authType === "basic") {
       requestHeaders.push({ id: -1, name: "Authorization", value: `Basic ${btoa(`${authFields.username}:${authFields.password}`)}`, enabled: true });
@@ -173,15 +189,23 @@ function App() {
       else requestHeaders.push({ id: -1, name: authFields.key, value: authFields.value, enabled: true });
     }
 
-    let requestBody: string | null = body;
-    if (["GET", "HEAD"].includes(method)) requestBody = null;
+    const canHaveBody = !["GET", "HEAD"].includes(method);
+    let requestBody: string | null = canHaveBody ? body : null;
     if (requestBody !== null && bodyMode === "form") {
       requestBody = new URLSearchParams(
         formRows.filter((row) => row.enabled && row.name).map((row) => [row.name, row.value]),
       ).toString();
     }
+    if (bodyMode === "multipart" || bodyMode === "binary") requestBody = null;
 
-    return { url: requestUrl.toString(), headers: requestHeaders, body: requestBody };
+    return {
+      url: requestUrl.toString(),
+      headers: requestHeaders,
+      body_kind: canHaveBody && (bodyMode === "multipart" || bodyMode === "binary") ? bodyMode : "text",
+      body: requestBody,
+      multipart_fields: canHaveBody && bodyMode === "multipart" ? multipartRows : [],
+      binary_file: canHaveBody && bodyMode === "binary" && binaryFile ? binaryFile : null,
+    };
   }
 
   async function sendRequest(event: FormEvent) {
@@ -220,6 +244,17 @@ function App() {
 
   function updateAuth(field: string, value: string) {
     setAuthFields((current) => ({ ...current, [field]: value }));
+  }
+
+  async function chooseFile(onSelected: (path: string) => void) {
+    const selected = await open({ multiple: false, directory: false });
+    if (selected) onSelected(selected);
+  }
+
+  function updateMultipartRow(id: number, field: keyof MultipartRow, value: string | boolean) {
+    setMultipartRows((current) =>
+      current.map((row) => (row.id === id ? { ...row, [field]: value } : row)),
+    );
   }
 
   return (
@@ -268,10 +303,23 @@ function App() {
             {requestTab === "Body" && (
               <>
                 <div className="editor-toolbar body-toolbar">
-                  <div>{(["json", "text", "xml", "form"] as BodyMode[]).map((mode) => <button className={bodyMode === mode ? "active" : ""} key={mode} onClick={() => setBodyMode(mode)} type="button">{mode === "form" ? "Form URL Encoded" : mode.toUpperCase()}</button>)}</div>
+                  <div>{(["json", "text", "xml", "form", "multipart", "binary"] as BodyMode[]).map((mode) => <button className={bodyMode === mode ? "active" : ""} key={mode} onClick={() => setBodyMode(mode)} type="button">{mode === "form" ? "Form URL Encoded" : mode === "multipart" ? "Multipart" : mode.toUpperCase()}</button>)}</div>
                   {bodyMode === "json" && <button type="button" onClick={() => setBody(prettyBody(body))}>Format</button>}
                 </div>
-                {bodyMode === "form" ? <KeyValueTable rows={formRows} setRows={setFormRows} label="Field" /> : <textarea value={body} onChange={(event) => setBody(event.target.value)} spellCheck={false} />}
+                {bodyMode === "form" && <KeyValueTable rows={formRows} setRows={setFormRows} label="Field" />}
+                {bodyMode === "multipart" && <div className="key-value-table multipart-table">
+                  <div className="table-labels"><span /><span>Type</span><span>Field</span><span>Value</span><span /></div>
+                  {multipartRows.map((row) => <div className="key-value-row" key={row.id}>
+                    <input checked={row.enabled} onChange={(event) => updateMultipartRow(row.id, "enabled", event.target.checked)} type="checkbox" aria-label={`Enable ${row.name || "multipart field"}`} />
+                    <select value={row.kind} onChange={(event) => updateMultipartRow(row.id, "kind", event.target.value)} aria-label="Multipart field type"><option value="text">Text</option><option value="file">File</option></select>
+                    <input value={row.name} onChange={(event) => updateMultipartRow(row.id, "name", event.target.value)} placeholder="Field name" aria-label="Multipart field name" />
+                    {row.kind === "file" ? <button className="file-picker" type="button" onClick={() => chooseFile((path) => updateMultipartRow(row.id, "value", path))}>{row.value ? fileName(row.value) : "Choose file..."}</button> : <input value={row.value} onChange={(event) => updateMultipartRow(row.id, "value", event.target.value)} placeholder="Value" aria-label="Multipart field value" />}
+                    <button type="button" className="row-remove" onClick={() => setMultipartRows((current) => current.filter((item) => item.id !== row.id))} aria-label="Remove multipart field">×</button>
+                  </div>)}
+                  <button className="add-row" type="button" onClick={() => setMultipartRows((current) => [...current, emptyMultipartRow()])}>+ Add field</button>
+                </div>}
+                {bodyMode === "binary" && <div className="file-body"><strong>Binary file</strong><span>{binaryFile || "No file selected."}</span><button className="file-picker" type="button" onClick={() => chooseFile(setBinaryFile)}>{binaryFile ? "Choose another file" : "Choose file..."}</button></div>}
+                {!["form", "multipart", "binary"].includes(bodyMode) && <textarea value={body} onChange={(event) => setBody(event.target.value)} spellCheck={false} />}
               </>
             )}
             {requestTab === "Auth" && (
