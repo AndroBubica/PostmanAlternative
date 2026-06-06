@@ -264,9 +264,11 @@ Key interaction rules:
 - [ ] Confirm and publish Windows x64 and universal macOS portable packages
   - Universal macOS portable archive built locally on June 6, 2026 and its
     executable verified as `x86_64 arm64`.
+  - Universal macOS `v0.1.2` was published and independently downloaded,
+    checksum-verified, and architecture-verified on June 6, 2026.
   - CI now verifies archive checksums/layouts and launch-smoke-tests portable
     workspace creation before upload.
-  - Windows x64 build and publication still require running the release workflow.
+  - Windows x64 publication and physical testing are deferred.
 - [x] AES-256-GCM encrypted secret vault with Argon2 password derivation
 - [x] Multi-request tabs, autosave, and unsaved-exit warning
 - [x] Global, collection, environment, and temporary variables with source explanations
@@ -347,6 +349,8 @@ Validation commands passed:
 #### Remaining Phase 1 Work
 
 - [ ] Build, test, and publish actual Windows x64 and universal macOS portable packages
+  - [x] Build, test, and publish universal macOS package
+  - [ ] Build, test, and publish Windows x64 package (deferred)
 - [x] Portable launchers and shared USB folder layout generator
 - [x] Encrypted secret vault
 - [x] Nested collection folders, rename, duplicate, request move, delete, and favorites

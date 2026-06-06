@@ -11,6 +11,14 @@ launch-smoke-tests, and uploads:
 Tagged builds also publish both archives and their SHA-256 checksum files to
 the GitHub release.
 
+Published macOS release:
+
+- `v0.1.2`: https://github.com/AndroBubica/PostmanAlternative/releases/tag/v0.1.2
+- Downloaded checksum verified and executable architectures confirmed as
+  `x86_64 arm64` on June 6, 2026.
+
+Windows release publication is currently deferred.
+
 Before upload, each CI runner extracts its archive, verifies the expected
 portable layout, launches the packaged executable, and confirms that
 `workspace/api-lantern.json` is created beside the application.
