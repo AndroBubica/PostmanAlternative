@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "check": "corepack pnpm lint && corepack pnpm build",
+    "check": "corepack pnpm lint && corepack pnpm test:frontend && corepack pnpm build",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
+    "test:frontend": "node --experimental-strip-types --test src/interface.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "portable:layout": "bash scripts/create-portable-layout.sh"

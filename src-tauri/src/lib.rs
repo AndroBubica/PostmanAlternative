@@ -296,8 +296,19 @@ fn save_workspace_collection(
 }
 
 #[tauri::command]
-fn delete_workspace_collection(app: tauri::AppHandle, collection_id: String) -> Result<(), String> {
+fn delete_workspace_collection(
+    app: tauri::AppHandle,
+    collection_id: String,
+) -> Result<workspace::DeletedCollectionSnapshot, String> {
     workspace::delete_collection(&app, &collection_id)
+}
+
+#[tauri::command]
+fn restore_workspace_collection(
+    app: tauri::AppHandle,
+    snapshot: workspace::DeletedCollectionSnapshot,
+) -> Result<(), String> {
+    workspace::restore_collection(&app, &snapshot)
 }
 
 #[tauri::command]
@@ -371,6 +382,63 @@ fn save_vault(
     Ok(())
 }
 
+fn apply_vault_operation(
+    entries: &mut HashMap<String, String>,
+    operation: &str,
+    old_name: &str,
+    new_name: String,
+    value: String,
+) -> Result<(), String> {
+    match operation {
+        "rename" => {
+            if let Some(secret) = entries.remove(old_name) {
+                entries.insert(new_name, secret);
+            }
+        }
+        "set" => {
+            entries.insert(new_name, value);
+        }
+        "remove" | "plain" => {
+            entries.remove(old_name);
+        }
+        _ => return Err("Unsupported vault operation.".into()),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn mutate_vault_entry(
+    app: tauri::AppHandle,
+    operation: String,
+    old_name: String,
+    new_name: String,
+    value: String,
+    state: tauri::State<'_, VaultState>,
+) -> Result<HashMap<String, String>, String> {
+    let mut unlocked = state
+        .unlocked
+        .lock()
+        .map_err(|_| "Could not update vault.".to_string())?;
+    let (password, entries) = unlocked.as_mut().ok_or("Unlock the vault first.")?;
+    apply_vault_operation(entries, &operation, &old_name, new_name, value)?;
+    vault::save(&vault_path(&app)?, password, entries)?;
+    Ok(entries.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_operations_migrate_and_remove_secrets() {
+        let mut entries = HashMap::from([("old".into(), "secret".into())]);
+        apply_vault_operation(&mut entries, "rename", "old", "new".into(), String::new()).unwrap();
+        assert_eq!(entries.get("new").map(String::as_str), Some("secret"));
+        apply_vault_operation(&mut entries, "plain", "new", String::new(), String::new()).unwrap();
+        assert!(entries.is_empty());
+    }
+}
+
 #[tauri::command]
 fn lock_vault(state: tauri::State<'_, VaultState>) -> Result<(), String> {
     *state
@@ -419,12 +487,14 @@ pub fn run() {
             create_workspace_collection,
             save_workspace_collection,
             delete_workspace_collection,
+            restore_workspace_collection,
             save_workspace_environment,
             delete_workspace_environment,
             save_workspace_settings,
             save_workspace_globals,
             unlock_vault,
             save_vault,
+            mutate_vault_entry,
             lock_vault,
             add_workspace_history,
             import_workspace_file,

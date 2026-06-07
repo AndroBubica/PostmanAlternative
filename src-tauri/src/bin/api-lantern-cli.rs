@@ -2,7 +2,7 @@ use api_lantern_lib::workspace::{
     Collection, Environment, RequestAssertion, SavedRequest, Variable,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use reqwest::{header::HeaderName, Method, Url};
+use reqwest::{header::HeaderName, multipart, Method, Url};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -188,6 +188,45 @@ fn compare(assertion: &RequestAssertion, actual: Option<Value>) -> TestResult {
     }
 }
 
+fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    let mut token = String::new();
+    let mut chars = path
+        .trim_start_matches('$')
+        .trim_start_matches('.')
+        .chars()
+        .peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '.' => {
+                if !token.is_empty() {
+                    current = current.get(&token)?;
+                    token.clear();
+                }
+            }
+            '[' => {
+                if !token.is_empty() {
+                    current = current.get(&token)?;
+                    token.clear();
+                }
+                let mut index = String::new();
+                for character in chars.by_ref() {
+                    if character == ']' {
+                        break;
+                    }
+                    index.push(character);
+                }
+                current = current.get(index.parse::<usize>().ok()?)?;
+            }
+            _ => token.push(character),
+        }
+    }
+    if !token.is_empty() {
+        current = current.get(&token)?;
+    }
+    Some(current)
+}
+
 fn assertions(
     items: &[RequestAssertion],
     status: u16,
@@ -209,13 +248,7 @@ fn assertions(
                     .map(Value::String),
                 "json-path" => {
                     let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-                    item.target
-                        .trim_start_matches('$')
-                        .trim_start_matches('.')
-                        .split('.')
-                        .filter(|part| !part.is_empty())
-                        .try_fold(&parsed, |value, part| value.get(part))
-                        .cloned()
+                    json_path(&parsed, &item.target).cloned()
                 }
                 _ => None,
             };
@@ -228,9 +261,6 @@ async fn run_request(
     request: &SavedRequest,
     variables: &HashMap<String, String>,
 ) -> Result<RunItem, String> {
-    if ["multipart", "binary"].contains(&request.body_mode.as_str()) {
-        return Err("CLI runner does not yet support multipart or binary request bodies.".into());
-    }
     let started = Instant::now();
     let mut url =
         Url::parse(&resolve(&request.url, variables)?).map_err(|error| error.to_string())?;
@@ -277,16 +307,38 @@ async fn run_request(
     let method =
         Method::from_bytes(request.method.as_bytes()).map_err(|error| error.to_string())?;
     let mut builder = client.request(method, url.clone());
-    for header in request
-        .headers
-        .iter()
-        .filter(|header| header.enabled && !header.name.is_empty())
-    {
+    for header in request.headers.iter().filter(|header| {
+        header.enabled
+            && !header.name.is_empty()
+            && !(request.body_mode == "multipart"
+                && header.name.eq_ignore_ascii_case("content-type"))
+    }) {
         builder = builder.header(
             HeaderName::from_bytes(resolve(&header.name, variables)?.as_bytes())
                 .map_err(|error| error.to_string())?,
             resolve(&header.value, variables)?,
         );
+    }
+    let has_content_type = request
+        .headers
+        .iter()
+        .any(|header| header.enabled && header.name.eq_ignore_ascii_case("content-type"));
+    let content_type_disabled = request
+        .headers
+        .iter()
+        .any(|header| !header.enabled && header.name.eq_ignore_ascii_case("content-type"));
+    if !has_content_type && !content_type_disabled {
+        let content_type = match request.body_mode.as_str() {
+            "json" => Some("application/json"),
+            "text" => Some("text/plain"),
+            "xml" => Some("application/xml"),
+            "form" => Some("application/x-www-form-urlencoded"),
+            "binary" => Some("application/octet-stream"),
+            _ => None,
+        };
+        if let Some(content_type) = content_type {
+            builder = builder.header("Content-Type", content_type);
+        }
     }
     if request.auth_type == "basic" {
         let username = resolve(
@@ -343,34 +395,65 @@ async fn run_request(
         }
     }
     if !["GET", "HEAD"].contains(&request.method.as_str()) {
-        let body = if request.body_mode == "form" {
-            request
-                .form_rows
+        if request.body_mode == "multipart" {
+            let mut form = multipart::Form::new();
+            for row in request
+                .multipart_rows
                 .iter()
                 .filter(|row| row.enabled && !row.name.is_empty())
-                .map(|row| {
-                    Ok((
-                        resolve(&row.name, variables)?,
-                        resolve(&row.value, variables)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?
-                .into_iter()
-                .collect::<HashMap<_, _>>()
-                .into_iter()
-                .map(|(key, value)| {
-                    format!(
-                        "{}={}",
-                        urlencoding::encode(&key),
-                        urlencoding::encode(&value)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("&")
+            {
+                let name = resolve(&row.name, variables)?;
+                let value = resolve(&row.value, variables)?;
+                form = if row.kind.as_deref() == Some("file") {
+                    let bytes = fs::read(&value).map_err(|error| {
+                        format!("Could not read multipart file '{value}'. ({error})")
+                    })?;
+                    let file_name = Path::new(&value)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    form.part(name, multipart::Part::bytes(bytes).file_name(file_name))
+                } else {
+                    form.text(name, value)
+                };
+            }
+            builder = builder.multipart(form);
+        } else if request.body_mode == "binary" {
+            let path = resolve(&request.binary_file, variables)?;
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("Could not read binary file '{path}'. ({error})"))?;
+            builder = builder.body(bytes);
         } else {
-            resolve(&request.body, variables)?
-        };
-        builder = builder.body(body);
+            let body = if request.body_mode == "form" {
+                request
+                    .form_rows
+                    .iter()
+                    .filter(|row| row.enabled && !row.name.is_empty())
+                    .map(|row| {
+                        Ok((
+                            resolve(&row.name, variables)?,
+                            resolve(&row.value, variables)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+                    .into_iter()
+                    .collect::<HashMap<_, _>>()
+                    .into_iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{}={}",
+                            urlencoding::encode(&key),
+                            urlencoding::encode(&value)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&")
+            } else {
+                resolve(&request.body, variables)?
+            };
+            builder = builder.body(body);
+        }
     }
     let response = builder.send().await.map_err(|error| error.to_string())?;
     let status = response.status().as_u16();
@@ -405,7 +488,9 @@ fn junit(report: &RunReport) -> String {
         value
             .replace('&', "&amp;")
             .replace('<', "&lt;")
+            .replace('>', "&gt;")
             .replace('"', "&quot;")
+            .replace('\'', "&apos;")
     };
     let cases = report
         .items
@@ -570,5 +655,54 @@ mod tests {
         };
         assert!(compare(&assertion, Some(Value::from(200))).passed);
         assert!(!compare(&assertion, Some(Value::from(500))).passed);
+    }
+
+    #[test]
+    fn json_path_supports_array_indexes() {
+        let value = serde_json::json!({"items": [{"id": 42}]});
+        assert_eq!(json_path(&value, "$.items[0].id"), Some(&Value::from(42)));
+    }
+
+    #[test]
+    fn evaluates_every_assertion_operator() {
+        let make = |operator: &str, expected: &str| RequestAssertion {
+            id: operator.into(),
+            kind: "body".into(),
+            operator: operator.into(),
+            target: String::new(),
+            expected: expected.into(),
+            enabled: true,
+        };
+        assert!(compare(&make("equals", "42"), Some(Value::from(42))).passed);
+        assert!(compare(&make("not-equals", "41"), Some(Value::from(42))).passed);
+        assert!(compare(&make("contains", "ell"), Some(Value::from("hello"))).passed);
+        assert!(compare(&make("exists", ""), Some(Value::from(true))).passed);
+        assert!(compare(&make("less-than", "50"), Some(Value::from(42))).passed);
+    }
+
+    #[test]
+    fn junit_escapes_xml_attributes() {
+        let report = RunReport {
+            collection: "A & \"B\"".into(),
+            started_at: 0,
+            elapsed_ms: 1,
+            passed: 0,
+            failed: 1,
+            items: vec![RunItem {
+                request_id: "1".into(),
+                name: "<request>".into(),
+                method: "GET".into(),
+                url: String::new(),
+                status: None,
+                elapsed_ms: 1,
+                tests: vec![],
+                error: "'failed'".into(),
+            }],
+        };
+        let xml = junit(&report);
+        assert!(xml.contains("&amp;"));
+        assert!(xml.contains("&quot;"));
+        assert!(xml.contains("&lt;request&gt;"));
+        assert!(xml.contains("&apos;failed&apos;"));
     }
 }

@@ -2,6 +2,15 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+import {
+  assertionError,
+  assertionOperators,
+  assertionResults as evaluateAssertions,
+  buildRequest as buildSharedRequest,
+  parseCurl,
+  reportContents,
+  requestToCurl,
+} from "./interface";
 
 type KeyValueRow = {
   id: number;
@@ -45,6 +54,7 @@ type HistoryEntry = {
   status: number | null;
   elapsed_ms: number | null;
   created_at: number;
+  request_snapshot?: SavedRequest;
 };
 type SavedRequest = {
   id: string;
@@ -79,6 +89,7 @@ type WorkspaceSnapshot = {
   settings: { historyLimit: number; logLimitMb: number; autosave: boolean };
   global_variables: Variable[];
 };
+type DeletedCollectionSnapshot = { collections: Collection[]; requests: SavedRequest[] };
 
 type OpenTab = {
   key: string;
@@ -90,6 +101,7 @@ type OpenTab = {
   responseView: ResponseView;
   responseTree: boolean;
   responseSearch: string;
+  requestTab: string;
   saved: boolean;
 };
 type UndoAction = { message: string; run: () => Promise<void> };
@@ -276,6 +288,7 @@ function App() {
   const [testResults, setTestResults] = useState<TestResult[]>([]);
   const [runReport, setRunReport] = useState<RunReport | null>(null);
   const [runningCollection, setRunningCollection] = useState(false);
+  const [runnerProgress, setRunnerProgress] = useState("");
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
   const [activeTabKey, setActiveTabKey] = useState("");
   const [temporaryVariables, setTemporaryVariables] = useState<Variable[]>([]);
@@ -284,8 +297,10 @@ function App() {
   const [undoAction, setUndoAction] = useState<UndoAction | null>(null);
   const [responseTree, setResponseTree] = useState(false);
   const [pendingWrites, setPendingWrites] = useState(0);
+  const [collapsedCollections, setCollapsedCollections] = useState<Set<string>>(() => new Set(JSON.parse(localStorage.getItem("collapsedCollections") ?? "[]")));
   const skipDirty = useRef(true);
   const activeRequestId = useRef("");
+  const runnerCancelled = useRef(false);
   const workspaceWriteQueue = useRef<Promise<unknown>>(Promise.resolve());
 
   function queueWorkspaceWrite<T>(write: () => Promise<T>) {
@@ -379,67 +394,8 @@ function App() {
     );
   }, [search, workspace]);
 
-  function resolveVariables(value: string) {
-    const unresolved: string[] = [];
-    const resolved = value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, name: string) => {
-      if (!scopedVariables.has(name)) {
-        unresolved.push(name);
-        return `{{${name}}}`;
-      }
-      const found = scopedVariables.get(name)!.variable;
-      return found.secret && vaultEntries?.[name] !== undefined ? vaultEntries[name] : found.value;
-    });
-    if (unresolved.length) throw new Error(`Unresolved variables: ${[...new Set(unresolved)].join(", ")}`);
-    return resolved;
-  }
-
   function buildRequest() {
-    const requestUrl = new URL(resolveVariables(url));
-    params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(resolveVariables(row.name), resolveVariables(row.value)));
-    const requestHeaders = headers.filter((header) => header.enabled).map((header) => ({ ...header, name: resolveVariables(header.name), value: resolveVariables(header.value) }));
-    const contentTypeDisabled = headers.some((header) => !header.enabled && header.name.toLowerCase() === "content-type");
-    const contentTypes: Partial<Record<BodyMode, string>> = {
-      json: "application/json",
-      text: "text/plain",
-      xml: "application/xml",
-      form: "application/x-www-form-urlencoded",
-      binary: "application/octet-stream",
-    };
-    const contentType = requestHeaders.find((header) => header.name.toLowerCase() === "content-type");
-    if (bodyMode === "multipart") {
-      if (contentType) contentType.enabled = false;
-    } else {
-      const value = contentTypes[bodyMode];
-      if (value && contentType) contentType.value = value;
-      else if (value && !contentTypeDisabled) requestHeaders.push({ id: -2, name: "Content-Type", value, enabled: true });
-    }
-
-    if (authType === "basic") {
-      requestHeaders.push({ id: -1, name: "Authorization", value: `Basic ${btoa(`${resolveVariables(authFields.username)}:${resolveVariables(authFields.password)}`)}`, enabled: true });
-    } else if (authType === "bearer") {
-      requestHeaders.push({ id: -1, name: "Authorization", value: `Bearer ${resolveVariables(authFields.token)}`, enabled: true });
-    } else if (authType === "api-key" && authFields.key) {
-      if (authFields.location === "query") requestUrl.searchParams.append(resolveVariables(authFields.key), resolveVariables(authFields.value));
-      else requestHeaders.push({ id: -1, name: resolveVariables(authFields.key), value: resolveVariables(authFields.value), enabled: true });
-    }
-
-    const canHaveBody = !["GET", "HEAD"].includes(method);
-    let requestBody: string | null = canHaveBody ? resolveVariables(body) : null;
-    if (requestBody !== null && bodyMode === "form") {
-      requestBody = new URLSearchParams(
-        formRows.filter((row) => row.enabled && row.name).map((row) => [resolveVariables(row.name), resolveVariables(row.value)]),
-      ).toString();
-    }
-    if (bodyMode === "multipart" || bodyMode === "binary") requestBody = null;
-
-    return {
-      url: requestUrl.toString(),
-      headers: requestHeaders,
-      body_kind: canHaveBody && (bodyMode === "multipart" || bodyMode === "binary") ? bodyMode : "text",
-      body: requestBody,
-      multipart_fields: canHaveBody && bodyMode === "multipart" ? multipartRows.filter((row) => row.enabled).map((row) => ({ ...row, name: resolveVariables(row.name), value: resolveVariables(row.value) })) : [],
-      binary_file: canHaveBody && bodyMode === "binary" && binaryFile ? binaryFile : null,
-    };
+    return buildSharedRequest(currentRequest(), variableValues());
   }
 
   function runSandboxScript(
@@ -447,8 +403,10 @@ function App() {
     context: { request: Record<string, unknown>; response: ApiResponse | null; variables: Record<string, string> },
   ): Promise<{ request: Record<string, unknown>; variables: Record<string, string>; tests: TestResult[] }> {
     const workerSource = `
+      const ScriptFunction = Function;
       self.fetch = undefined; self.XMLHttpRequest = undefined; self.WebSocket = undefined; self.EventSource = undefined;
       self.WebTransport = undefined; self.Worker = undefined; self.SharedWorker = undefined; self.importScripts = undefined;
+      self.indexedDB = undefined; self.caches = undefined; self.eval = undefined; self.Function = undefined;
       self.onmessage = ({ data }) => {
         const tests = [];
         const lantern = {
@@ -467,7 +425,7 @@ function App() {
           }
         };
         try {
-          Function("lantern", "request", "response", "variables", '"use strict";\\n' + data.script)(lantern, data.request, data.response, data.variables);
+          ScriptFunction("lantern", "request", "response", "variables", '"use strict";\\n' + data.script)(lantern, data.request, data.response, data.variables);
           self.postMessage({ request: data.request, variables: data.variables, tests });
         } catch (error) {
           self.postMessage({ error: String(error?.message || error), request: data.request, variables: data.variables, tests });
@@ -511,45 +469,31 @@ function App() {
     return values;
   }
 
-  function assertionResults(items: RequestAssertion[], result: ApiResponse): TestResult[] {
-    const jsonPath = (path: string) => {
-      let value: unknown = JSON.parse(result.body);
-      for (const key of path.replace(/^\$\.?/, "").split(".").filter(Boolean)) value = (value as Record<string, unknown>)?.[key];
-      return value;
-    };
-    return items.filter((item) => item.enabled).map((item) => {
-      let actual: unknown;
-      try {
-        if (item.kind === "status") actual = result.status;
-        if (item.kind === "response-time") actual = result.elapsed_ms;
-        if (item.kind === "body") actual = result.body;
-        if (item.kind === "header") actual = result.headers.find((header) => header.name.toLowerCase() === item.target.toLowerCase())?.value;
-        if (item.kind === "json-path") actual = jsonPath(item.target);
-        const passed = item.operator === "exists" ? actual !== undefined && actual !== null
-          : item.operator === "contains" ? String(actual).includes(item.expected)
-          : item.operator === "not-equals" ? String(actual) !== item.expected
-          : item.operator === "less-than" ? Number(actual) < Number(item.expected)
-          : String(actual) === item.expected;
-        return { name: `${item.kind} ${item.target || item.operator}`, passed, message: passed ? "" : `Expected ${item.operator} ${item.expected || "a value"}, received ${JSON.stringify(actual)}` };
-      } catch (assertionError) {
-        return { name: `${item.kind} ${item.target || item.operator}`, passed: false, message: String(assertionError) };
-      }
-    });
-  }
+  const assertionResults = evaluateAssertions;
 
   async function sendRequest(event: FormEvent) {
     event.preventDefault();
+    if (runningCollection) {
+      setError("Cancel or finish the collection run before sending another request.");
+      return;
+    }
     setSending(true);
     setError("");
     const transportRequestId = crypto.randomUUID();
     activeRequestId.current = transportRequestId;
     try {
+      const invalid = assertions.map(assertionError).filter(Boolean);
+      if (invalid.length) throw new Error(`Fix assertions before sending: ${invalid.join(" ")}`);
       let built = buildRequest();
       let scriptResults: TestResult[] = [];
       if (scriptsEnabled && preRequestScript.trim()) {
-        const scripted = await runSandboxScript(preRequestScript, { request: built, response: null, variables: variableValues() });
-        built = scripted.request as typeof built;
-        scriptResults = scripted.tests.map((test) => ({ ...test, name: `Pre-request: ${test.name}` }));
+        try {
+          const scripted = await runSandboxScript(preRequestScript, { request: built, response: null, variables: variableValues() });
+          built = scripted.request as typeof built;
+          scriptResults = scripted.tests.map((test) => ({ ...test, name: `Pre-request: ${test.name}` }));
+        } catch (scriptError) {
+          scriptResults = [{ name: "Pre-request script", passed: false, message: String(scriptError) }];
+        }
       }
       const result = await invoke<ApiResponse>("send_request", {
         request: {
@@ -565,7 +509,7 @@ function App() {
       if (scriptsEnabled && postResponseScript.trim()) {
         try {
           const scripted = await runSandboxScript(postResponseScript, { request: built, response: result, variables: variableValues() });
-          results = [...results, ...scripted.tests];
+          results = [...results, ...scripted.tests.map((test) => ({ ...test, name: `Post-response: ${test.name}` }))];
         } catch (scriptError) {
           results = [...results, { name: "Post-response script", passed: false, message: String(scriptError) }];
         }
@@ -581,12 +525,12 @@ function App() {
         status: result.status,
         elapsed_ms: result.elapsed_ms,
         created_at: Date.now(),
+        request_snapshot: currentRequest(),
       };
       await invoke("add_workspace_history", { entry });
       await refreshWorkspace();
     } catch (requestError) {
-      setResponse(null);
-      setTestResults([]);
+      if (!response) setTestResults([]);
       setError(String(requestError));
     } finally {
       activeRequestId.current = "";
@@ -647,6 +591,13 @@ function App() {
     await refreshWorkspace();
   }
 
+  function activeSnapshotTab(): OpenTab {
+    return {
+      key: crypto.randomUUID(), request: currentRequest(), response, error, testResults,
+      responseTab, responseView, responseTree, responseSearch, requestTab, saved,
+    };
+  }
+
   function loadRequest(request: SavedRequest) {
     if (activeTabKey) captureActiveTab();
     const existing = openTabs.find((tab) => tab.request.id === request.id);
@@ -657,9 +608,9 @@ function App() {
     }
     const tab: OpenTab = {
       key: crypto.randomUUID(), request, response: null, error: "", testResults: [],
-      responseTab: "Body", responseView: "pretty", responseTree: false, responseSearch: "", saved: true,
+      responseTab: "Body", responseView: "pretty", responseTree: false, responseSearch: "", requestTab: "Body", saved: true,
     };
-    setOpenTabs((current) => [...current, tab]);
+    setOpenTabs((current) => current.length ? [...current, tab] : [activeSnapshotTab(), tab]);
     setActiveTabKey(tab.key);
     applyRequest(tab);
   }
@@ -695,6 +646,7 @@ function App() {
     setResponseView(tab.responseView);
     setResponseTree(tab.responseTree);
     setResponseSearch(tab.responseSearch);
+    setRequestTab(tab.requestTab);
     setSaved(tab.saved);
   }
 
@@ -702,7 +654,7 @@ function App() {
     if (!activeTabKey) return;
     const request = currentRequest();
     setOpenTabs((current) => current.map((tab) => tab.key === activeTabKey ? {
-      ...tab, request, response, error, testResults, responseTab, responseView, responseTree, responseSearch, saved,
+      ...tab, request, response, error, testResults, responseTab, responseView, responseTree, responseSearch, requestTab, saved,
     } : tab));
   }
 
@@ -723,9 +675,9 @@ function App() {
     };
     const tab: OpenTab = {
       key: crypto.randomUUID(), request: blank, response: null, error: "", testResults: [],
-      responseTab: "Body", responseView: "pretty", responseTree: false, responseSearch: "", saved: false,
+      responseTab: "Body", responseView: "pretty", responseTree: false, responseSearch: "", requestTab: "Body", saved: false,
     };
-    setOpenTabs((current) => [...current, tab]);
+    setOpenTabs((current) => current.length ? [...current, tab] : [activeSnapshotTab(), tab]);
     setActiveTabKey(tab.key);
     applyRequest(tab);
     setRequestId("");
@@ -748,7 +700,7 @@ function App() {
   function closeTab(key: string) {
     const closing = openTabs.find((tab) => tab.key === key);
     const closingSaved = key === activeTabKey ? saved : closing?.saved;
-    if (closingSaved === false && !window.confirm("Close this tab and discard its unsaved changes?")) return;
+    if ((closingSaved === false || pendingWrites > 0) && !window.confirm("Close this tab and discard its unsaved or pending changes?")) return;
     const remaining = openTabs.filter((tab) => tab.key !== key);
     setOpenTabs(remaining);
     if (key === activeTabKey) {
@@ -815,37 +767,14 @@ function App() {
 
   async function deleteCollection(collection: Collection) {
     if (!window.confirm(`Delete "${collection.name}" and every request and folder inside it?`)) return;
-    const deletedCollections: Collection[] = [];
-    const deletedIds = new Set([collection.id]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      workspace?.collections.forEach((candidate) => {
-        if (deletedIds.has(candidate.id) || !candidate.parentId || !deletedIds.has(candidate.parentId)) return;
-        deletedIds.add(candidate.id);
-        changed = true;
-      });
-    }
-    workspace?.collections.forEach((candidate) => {
-      if (deletedIds.has(candidate.id)) deletedCollections.push(candidate);
-    });
-    const deletedRequests = workspace?.requests.filter((request) => deletedIds.has(request.collectionId)) ?? [];
-    await invoke("delete_workspace_collection", { collectionId: collection.id });
+    const snapshot = await invoke<DeletedCollectionSnapshot>("delete_workspace_collection", { collectionId: collection.id });
+    const deletedRequestIds = new Set(snapshot.requests.map((request) => request.id));
+    setOpenTabs((current) => current.filter((tab) => !deletedRequestIds.has(tab.request.id)));
+    if (deletedRequestIds.has(requestId)) newRequest();
     if (collectionId === collection.id) setCollectionId("default");
     setNotice(`Deleted "${collection.name}".`);
     setUndoAction({ message: `Restore "${collection.name}"`, run: async () => {
-      const remaining = [...deletedCollections];
-      const restored = new Set<string>();
-      while (remaining.length) {
-        const ready = remaining.filter((item) => !item.parentId || !deletedIds.has(item.parentId) || restored.has(item.parentId));
-        if (!ready.length) throw new Error("Could not restore the deleted collection hierarchy.");
-        for (const item of ready) {
-          await invoke("save_workspace_collection", { collection: item });
-          restored.add(item.id);
-          remaining.splice(remaining.indexOf(item), 1);
-        }
-      }
-      await Promise.all(deletedRequests.map((request) => invoke("save_workspace_request", { request })));
+      await invoke("restore_workspace_collection", { snapshot });
       await refreshWorkspace();
     } });
     await refreshWorkspace();
@@ -877,45 +806,38 @@ function App() {
     await refreshWorkspace();
   }
 
-  function buildSavedRequest(request: SavedRequest) {
-    const variables = variableValues(request.collectionId);
-    const resolve = (value: string) => value.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, name: string) => {
-      if (!(name in variables)) throw new Error(`Unresolved variable: ${name}`);
-      return variables[name];
+  function toggleCollection(id: string) {
+    setCollapsedCollections((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      localStorage.setItem("collapsedCollections", JSON.stringify([...next]));
+      return next;
     });
-    const requestUrl = new URL(resolve(request.url));
-    request.params.filter((row) => row.enabled && row.name).forEach((row) => requestUrl.searchParams.append(resolve(row.name), resolve(row.value)));
-    const requestHeaders = request.headers.filter((header) => header.enabled).map((header) => ({ ...header, name: resolve(header.name), value: resolve(header.value) }));
-    const contentTypeDisabled = request.headers.some((header) => !header.enabled && header.name.toLowerCase() === "content-type");
-    const contentTypes: Partial<Record<BodyMode, string>> = { json: "application/json", text: "text/plain", xml: "application/xml", form: "application/x-www-form-urlencoded", binary: "application/octet-stream" };
-    const contentType = requestHeaders.find((header) => header.name.toLowerCase() === "content-type");
-    if (request.bodyMode === "multipart") {
-      if (contentType) contentType.enabled = false;
-    } else if (contentTypes[request.bodyMode]) {
-      if (contentType) contentType.value = contentTypes[request.bodyMode]!;
-      else if (!contentTypeDisabled) requestHeaders.push({ id: -2, name: "Content-Type", value: contentTypes[request.bodyMode]!, enabled: true });
+  }
+
+  async function moveRequest(request: SavedRequest) {
+    if (!workspace) return;
+    const choices = workspace.collections.map(collectionPath);
+    const answer = window.prompt(`Move "${request.name}" to:\n${choices.map((choice, index) => `${index}: ${choice}`).join("\n")}`, String(Math.max(0, workspace.collections.findIndex((item) => item.id === request.collectionId))));
+    if (answer === null) return;
+    const index = Number(answer);
+    if (!Number.isInteger(index) || !workspace.collections[index]) {
+      setError("Choose a destination number from the move-request list.");
+      return;
     }
-    if (request.authType === "basic") requestHeaders.push({ id: -1, name: "Authorization", value: `Basic ${btoa(`${resolve(request.authFields.username ?? "")}:${resolve(request.authFields.password ?? "")}`)}`, enabled: true });
-    if (request.authType === "bearer") requestHeaders.push({ id: -1, name: "Authorization", value: `Bearer ${resolve(request.authFields.token ?? "")}`, enabled: true });
-    if (request.authType === "api-key" && request.authFields.key) {
-      if (request.authFields.location === "query") requestUrl.searchParams.append(resolve(request.authFields.key), resolve(request.authFields.value ?? ""));
-      else requestHeaders.push({ id: -1, name: resolve(request.authFields.key), value: resolve(request.authFields.value ?? ""), enabled: true });
-    }
-    const canHaveBody = !["GET", "HEAD"].includes(request.method);
-    let requestBody: string | null = canHaveBody ? resolve(request.body) : null;
-    if (canHaveBody && request.bodyMode === "form") requestBody = new URLSearchParams(request.formRows.filter((row) => row.enabled && row.name).map((row) => [resolve(row.name), resolve(row.value)])).toString();
-    if (["multipart", "binary"].includes(request.bodyMode)) requestBody = null;
-    return {
-      url: requestUrl.toString(), headers: requestHeaders,
-      body_kind: canHaveBody && ["multipart", "binary"].includes(request.bodyMode) ? request.bodyMode : "text",
-      body: requestBody,
-      multipart_fields: canHaveBody && request.bodyMode === "multipart" ? request.multipartRows.filter((row) => row.enabled).map((row) => ({ ...row, name: resolve(row.name), value: resolve(row.value) })) : [],
-      binary_file: canHaveBody && request.bodyMode === "binary" && request.binaryFile ? request.binaryFile : null,
-    };
+    await invoke("save_workspace_request", { request: { ...request, collectionId: workspace.collections[index].id } });
+    setNotice(`Moved "${request.name}" to ${choices[index]}.`);
+    await refreshWorkspace();
+  }
+
+  function buildSavedRequest(request: SavedRequest) {
+    return buildSharedRequest(request, variableValues(request.collectionId));
   }
 
   async function runCollection(collection: Collection) {
     if (!workspace || runningCollection) return;
+    runnerCancelled.current = false;
     setRunningCollection(true);
     setError("");
     setResponseTab("Runner");
@@ -930,22 +852,31 @@ function App() {
     }
     try {
       const items: RunItem[] = [];
-      for (const savedRequest of workspace.requests.filter((request) => ids.has(request.collectionId))) {
+      const requests = workspace.requests.filter((request) => ids.has(request.collectionId));
+      for (const [index, savedRequest] of requests.entries()) {
+        if (runnerCancelled.current) break;
+        setRunnerProgress(`${index + 1}/${requests.length}: ${savedRequest.name}`);
         const itemStarted = performance.now();
         try {
           let built = buildSavedRequest(savedRequest);
           let scriptTests: TestResult[] = [];
           if (savedRequest.scriptsEnabled && savedRequest.preRequestScript?.trim()) {
-            const scripted = await runSandboxScript(savedRequest.preRequestScript, { request: built, response: null, variables: variableValues(savedRequest.collectionId) });
-            built = scripted.request as typeof built;
-            scriptTests = scripted.tests.map((test) => ({ ...test, name: `Pre-request: ${test.name}` }));
+            try {
+              const scripted = await runSandboxScript(savedRequest.preRequestScript, { request: built, response: null, variables: variableValues(savedRequest.collectionId) });
+              built = scripted.request as typeof built;
+              scriptTests = scripted.tests.map((test) => ({ ...test, name: `Pre-request: ${test.name}` }));
+            } catch (scriptError) {
+              scriptTests = [{ name: "Pre-request script", passed: false, message: String(scriptError) }];
+            }
           }
-          const result = await invoke<ApiResponse>("send_request", { request: { id: crypto.randomUUID(), method: savedRequest.method, ...built, timeout_ms: savedRequest.timeoutMs, follow_redirects: savedRequest.followRedirects } });
+          const transportId = crypto.randomUUID();
+          activeRequestId.current = transportId;
+          const result = await invoke<ApiResponse>("send_request", { request: { id: transportId, method: savedRequest.method, ...built, timeout_ms: savedRequest.timeoutMs, follow_redirects: savedRequest.followRedirects } });
           let tests = [...scriptTests, ...assertionResults(savedRequest.assertions ?? [], result)];
           if (savedRequest.scriptsEnabled && savedRequest.postResponseScript?.trim()) {
             try {
               const scripted = await runSandboxScript(savedRequest.postResponseScript, { request: built, response: result, variables: variableValues(savedRequest.collectionId) });
-              tests = [...tests, ...scripted.tests];
+              tests = [...tests, ...scripted.tests.map((test) => ({ ...test, name: `Post-response: ${test.name}` }))];
             } catch (scriptError) {
               tests = [...tests, { name: "Post-response script", passed: false, message: String(scriptError) }];
             }
@@ -960,16 +891,22 @@ function App() {
     } catch (runError) {
       setError(String(runError));
     } finally {
+      activeRequestId.current = "";
+      setRunnerProgress("");
       setRunningCollection(false);
     }
+  }
+
+  async function cancelCollectionRun() {
+    runnerCancelled.current = true;
+    await cancelRequest();
   }
 
   async function exportRunReport(format: "json" | "junit") {
     if (!runReport) return;
     const path = await save({ defaultPath: `api-lantern-report.${format === "junit" ? "xml" : "json"}` });
     if (!path) return;
-    const escapeXml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
-    const contents = format === "json" ? JSON.stringify(runReport, null, 2) : `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="${escapeXml(runReport.collection)}" tests="${runReport.items.length}" failures="${runReport.failed}" time="${runReport.elapsed_ms / 1000}">\n${runReport.items.map((item) => `  <testcase name="${escapeXml(item.name)}" classname="${escapeXml(runReport.collection)}" time="${item.elapsed_ms / 1000}">${item.error || item.tests.some((test) => !test.passed) ? `<failure message="${escapeXml(item.error || item.tests.filter((test) => !test.passed).map((test) => test.message).join("; "))}"/>` : ""}</testcase>`).join("\n")}\n</testsuite>\n`;
+    const contents = reportContents(runReport, format);
     await invoke("save_text_file", { path, contents });
     setNotice(`Saved ${format.toUpperCase()} report.`);
   }
@@ -980,26 +917,27 @@ function App() {
     return (
       <section className="collection" key={collection.id} style={{ marginLeft: `${depth * 10}px` }}>
         <div className="collection-heading">
-          <h2><span>⌄</span> {collection.name}</h2>
+          <h2><button className="collection-toggle" type="button" aria-expanded={!collapsedCollections.has(collection.id)} onClick={() => toggleCollection(collection.id)}>{collapsedCollections.has(collection.id) ? "›" : "⌄"}</button> {collection.name}</h2>
           <div className="collection-actions">
-            <button type="button" title="Run collection" aria-label={`Run ${collection.name}`} onClick={() => runCollection(collection)}>▶</button>
+            <button type="button" disabled={runningCollection} title="Run collection" aria-label={`Run ${collection.name}`} onClick={() => runCollection(collection)}>▶</button>
             <button type="button" title="New nested folder" aria-label={`New folder in ${collection.name}`} onClick={() => createCollection(collection.id)}>+</button>
             <button type="button" title="Rename" aria-label={`Rename ${collection.name}`} onClick={() => renameCollection(collection)}>✎</button>
             {collection.id !== "default" && <button type="button" title="Move folder" aria-label={`Move ${collection.name}`} onClick={() => moveCollection(collection)}>↪</button>}
             {collection.id !== "default" && <button type="button" title="Delete" aria-label={`Delete ${collection.name}`} onClick={() => deleteCollection(collection)}>×</button>}
           </div>
         </div>
-        {requests.map((request) => (
+        {!collapsedCollections.has(collection.id) && requests.map((request) => (
           <div className="request-item-row" key={request.id}>
             <button className="request-item" onClick={() => loadRequest(request)} type="button"><span className={methodColors[request.method]}>{request.method}</span>{request.name}</button>
             <div className="request-actions">
               <button type="button" title={request.favorite ? "Remove favorite" : "Add favorite"} aria-label={request.favorite ? `Remove ${request.name} from favorites` : `Add ${request.name} to favorites`} onClick={() => toggleFavorite(request)}>{request.favorite ? "★" : "☆"}</button>
               <button type="button" title="Duplicate" aria-label={`Duplicate ${request.name}`} onClick={() => duplicateRequest(request)}>⧉</button>
+              <button type="button" title="Move" aria-label={`Move ${request.name}`} onClick={() => moveRequest(request)}>↪</button>
               <button type="button" title="Delete" aria-label={`Delete ${request.name}`} onClick={() => deleteRequest(request)}>×</button>
             </div>
           </div>
         ))}
-        {children.map((child) => renderCollection(child, depth + 1))}
+        {!collapsedCollections.has(collection.id) && children.map((child) => renderCollection(child, depth + 1))}
       </section>
     );
   }
@@ -1015,34 +953,24 @@ function App() {
   async function importCurl() {
     const command = window.prompt("Paste a cURL command");
     if (!command?.trim()) return;
-    const tokens = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((token) => token.replace(/^(['"])(.*)\1$/, "$2")) ?? [];
-    let importedMethod = "GET";
-    let importedUrl = "";
-    let importedBody = "";
-    const importedHeaders: KeyValueRow[] = [];
-    for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index];
-      if ((token === "-X" || token === "--request") && tokens[index + 1]) importedMethod = tokens[++index].toUpperCase();
-      else if ((token === "-H" || token === "--header") && tokens[index + 1]) {
-        const header = tokens[++index];
-        const separator = header.indexOf(":");
-        importedHeaders.push({ ...emptyRow(), name: header.slice(0, separator).trim(), value: header.slice(separator + 1).trim() });
-      } else if (["-d", "--data", "--data-raw"].includes(token) && tokens[index + 1]) {
-        importedBody = tokens[++index];
-        if (importedMethod === "GET") importedMethod = "POST";
-      } else if (/^https?:\/\//.test(token)) importedUrl = token;
-    }
-    if (!importedUrl) {
+    const imported = parseCurl(command, emptyRow);
+    if (!imported.url) {
       setError("The cURL command does not contain an HTTP URL.");
       return;
     }
     newRequest();
     setRequestName("Imported cURL request");
-    setMethod(importedMethod);
-    setUrl(importedUrl);
-    setHeaders(importedHeaders.length ? importedHeaders : [{ id: 1, name: "Accept", value: "application/json", enabled: true }]);
-    setBody(importedBody);
-    setNotice("Imported cURL into a new unsaved request.");
+    setMethod(imported.method);
+    setUrl(imported.url);
+    setHeaders(imported.headers.length ? imported.headers : [{ id: 1, name: "Accept", value: "application/json", enabled: true }]);
+    setBody(imported.body);
+    setBodyMode(imported.bodyMode);
+    setFormRows(imported.formRows.length ? imported.formRows : [emptyRow()]);
+    setMultipartRows(imported.multipartRows.length ? imported.multipartRows : [emptyMultipartRow()]);
+    setBinaryFile(imported.binaryFile);
+    setAuthType(imported.authType);
+    setAuthFields((current) => ({ ...current, ...imported.authFields }));
+    setNotice(imported.warnings.length ? `Imported cURL. Unsupported options: ${imported.warnings.join(", ")}` : "Imported cURL into a new unsaved request.");
   }
 
   async function exportPortable() {
@@ -1054,12 +982,7 @@ function App() {
 
   function generateCurl() {
     try {
-      const built = buildRequest();
-      const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
-      const parts = ["curl", "-X", method, quote(built.url)];
-      built.headers.filter((header) => header.enabled).forEach((header) => parts.push("-H", quote(`${header.name}: ${header.value}`)));
-      if (built.body) parts.push("--data-raw", quote(built.body));
-      navigator.clipboard.writeText(parts.join(" ")).then(() => setNotice("Copied cURL command."));
+      navigator.clipboard.writeText(requestToCurl(method, buildRequest())).then(() => setNotice("Copied cURL command.")).catch((copyError) => setError(String(copyError)));
     } catch (curlError) { setError(String(curlError)); }
   }
 
@@ -1078,14 +1001,41 @@ function App() {
   }
 
   async function saveVaultEntry(name: string, value: string) {
-    const entries = { ...vaultEntries, [name]: value };
+    setVaultEntries((current) => ({ ...current, [name]: value }));
+    const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", { operation: "set", oldName: name, newName: name, value }));
     setVaultEntries(entries);
-    await queueWorkspaceWrite(() => invoke("save_vault", { entries }));
+  }
+
+  async function renameVariable(index: number, name: string) {
+    const variable = variablesForScope()[index];
+    if (!variable || variable.name === name) return;
+    if (variable.secret && !vaultEntries) {
+      setError("Unlock the vault before renaming a secret.");
+      return;
+    }
+    const variables = variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, name } : item);
+    const metadataWrite = updateVariables(variableScope, variables);
+    if (variable.secret) {
+      setVaultEntries((current) => {
+        const entries = { ...current };
+        if (variable.name in entries) {
+          entries[name] = entries[variable.name];
+          delete entries[variable.name];
+        }
+        return entries;
+      });
+      const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", { operation: "rename", oldName: variable.name, newName: name, value: "" }));
+      setVaultEntries(entries);
+    }
+    await metadataWrite;
   }
 
   async function updateVariables(scope: typeof variableScope, variables: Variable[]) {
+    if (scope === "temporary") {
+      setTemporaryVariables(variables);
+      return;
+    }
     if (!workspace) return;
-    if (scope === "temporary") setTemporaryVariables(variables);
     if (scope === "environment" && activeEnvironment) {
       const environment = { ...activeEnvironment, variables };
       setWorkspace((current) => current ? { ...current, environments: current.environments.map((item) => item.id === environment.id ? environment : item) } : current);
@@ -1142,6 +1092,17 @@ function App() {
     await queueWorkspaceWrite(() => invoke("save_workspace_environment", { environment }));
   }
 
+  async function saveWorkspaceSettings(settings: WorkspaceSnapshot["settings"]) {
+    if (!workspace || settings.historyLimit < 0 || settings.logLimitMb < 1 || !Number.isInteger(settings.historyLimit) || !Number.isInteger(settings.logLimitMb)) {
+      setError("History entries must be zero or more and log limit must be at least 1 MB.");
+      return;
+    }
+    setWorkspace({ ...workspace, settings });
+    await queueWorkspaceWrite(() => invoke("save_workspace_settings", { settings }));
+    setError("");
+    setNotice("Saved workspace settings.");
+  }
+
   async function toggleVariableSecret(index: number) {
     const variable = variablesForScope()[index];
     if (!variable) return;
@@ -1149,30 +1110,32 @@ function App() {
       setError("Unlock the vault before converting a variable to or from a secret.");
       return;
     }
-    const entries = { ...vaultEntries };
     const variables = variablesForScope().map((item, itemIndex) => {
       if (itemIndex !== index) return item;
       if (item.secret) {
-        const value = entries[item.name] ?? item.value;
-        delete entries[item.name];
+        const value = vaultEntries[item.name] ?? item.value;
         return { ...item, secret: false, value };
       }
-      entries[item.name] = item.value;
       return { ...item, secret: true, value: "" };
     });
+    const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", {
+      operation: variable.secret ? "plain" : "set", oldName: variable.name, newName: variable.name, value: variable.value,
+    }));
     setVaultEntries(entries);
-    await queueWorkspaceWrite(() => invoke("save_vault", { entries }));
     await updateVariables(variableScope, variables);
   }
 
   async function removeVariable(index: number) {
     const variable = variablesForScope()[index];
     if (!variable) return;
+    if (variable.secret && !window.confirm(`Remove secret "${variable.name || "unnamed"}" from this scope and the vault?`)) return;
+    if (variable.secret && !vaultEntries) {
+      setError("Unlock the vault before removing a secret.");
+      return;
+    }
     if (variable.secret && vaultEntries && variable.name in vaultEntries) {
-      const entries = { ...vaultEntries };
-      delete entries[variable.name];
+      const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", { operation: "remove", oldName: variable.name, newName: "", value: "" }));
       setVaultEntries(entries);
-      await queueWorkspaceWrite(() => invoke("save_vault", { entries }));
     }
     await updateVariables(variableScope, variablesForScope().filter((_item, itemIndex) => itemIndex !== index));
   }
@@ -1183,10 +1146,16 @@ function App() {
       loadRequest(linked);
       return;
     }
-    newRequest();
-    setMethod(entry.method);
-    setUrl(entry.url);
-    setRequestName(entry.name);
+    if (entry.request_snapshot) {
+      loadRequest({ ...entry.request_snapshot, id: crypto.randomUUID(), name: entry.name });
+      setRequestId("");
+      setSaved(false);
+    } else {
+      newRequest();
+      setMethod(entry.method);
+      setUrl(entry.url);
+      setRequestName(entry.name);
+    }
   }
 
   async function saveResponse() {
@@ -1196,6 +1165,7 @@ function App() {
     });
     if (path) {
       await invoke("save_response", { path, bodyBase64: response.body_base64 });
+      setNotice("Saved response.");
     }
   }
 
@@ -1248,18 +1218,20 @@ function App() {
           </section>}
           {workspace?.collections.filter((collection) => !collection.parentId).map((collection) => renderCollection(collection))}
         </nav></>}
-        {sidebarView === "history" && <nav aria-label="Request history"><p className="section-label">Recent requests</p>{workspace?.history.map((entry) => <button className="history-item" key={entry.id} onClick={() => openHistoryEntry(entry)} type="button"><span className={methodColors[entry.method]}>{entry.method}</span><strong>{entry.name}</strong><small>{entry.status ?? "Failed"} · {new Date(entry.created_at).toLocaleString()}</small></button>)}</nav>}
+        {sidebarView === "history" && <nav aria-label="Request history"><p className="section-label">Recent requests</p>{workspace?.history.map((entry) => <button className="history-item" key={entry.id} onClick={() => openHistoryEntry(entry)} type="button"><span className={methodColors[entry.method]}>{entry.method}</span><strong>{entry.name}</strong><small>{entry.status ?? "Failed"} · {new Date(entry.created_at).toLocaleString()}</small></button>)}{!workspace?.history.length && <div className="sidebar-empty">Sent requests will appear here.</div>}</nav>}
         {sidebarView === "environment" && <div className="environment-editor"><div className="environment-heading"><strong>Variables</strong><div><button onClick={addEnvironment} type="button">+ Environment</button>{activeEnvironment && <><button onClick={renameEnvironment} type="button">Rename</button><button onClick={deleteEnvironment} type="button">Delete</button></>}</div></div>
           <select className="scope-select" value={variableScope} onChange={(event) => setVariableScope(event.target.value as typeof variableScope)} aria-label="Variable scope"><option value="temporary">Temporary</option><option value="environment">Environment</option><option value="collection">Collection</option><option value="global">Global</option></select>
           <p>{variableScope === "environment" ? activeEnvironment?.name ?? "No environment" : variableScope === "collection" ? activeCollection?.name : `${variableScope[0].toUpperCase()}${variableScope.slice(1)} scope`}</p>
           {variablesForScope().map((variable, index) => <div className="variable-row" key={`${variable.name}-${index}`}>
             <input aria-label="Enable variable" checked={variable.enabled} onChange={(event) => updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, enabled: event.target.checked } : item))} type="checkbox" />
-            <input value={variable.name} onChange={(event) => updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item))} placeholder="Name" aria-label="Variable name" />
-            <input type={variable.secret ? "password" : "text"} value={variable.secret && vaultEntries?.[variable.name] !== undefined ? vaultEntries[variable.name] : variable.value} onChange={(event) => variable.secret && vaultEntries ? saveVaultEntry(variable.name, event.target.value) : updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, value: event.target.value } : item))} placeholder={variable.secret && !vaultEntries ? "Unlock vault" : "Value"} aria-label="Variable value" />
+            <input value={variable.name} onChange={(event) => renameVariable(index, event.target.value)} placeholder="Name" aria-label="Variable name" />
+            <input disabled={variable.secret && !vaultEntries} type={variable.secret ? "password" : "text"} value={variable.secret ? vaultEntries?.[variable.name] ?? "" : variable.value} onChange={(event) => variable.secret && vaultEntries ? saveVaultEntry(variable.name, event.target.value) : updateVariables(variableScope, variablesForScope().map((item, itemIndex) => itemIndex === index ? { ...item, value: event.target.value } : item))} placeholder={variable.secret && !vaultEntries ? "Locked secret" : "Value"} aria-label="Variable value" />
             <div className="variable-actions"><button title="Toggle secret" onClick={() => toggleVariableSecret(index)} type="button">{variable.secret ? "Encrypted" : "Plain"}</button>
             <button title="Remove variable" aria-label={`Remove variable ${variable.name || index + 1}`} onClick={() => removeVariable(index)} type="button">Remove</button></div>
           </div>)}
           <button className="add-variable" onClick={() => updateVariables(variableScope, [...variablesForScope(), { name: "", value: "", secret: false, enabled: true }])} type="button">+ Add variable</button>
+          {variableScope === "environment" && !activeEnvironment && <div className="sidebar-empty">Create or select an environment to add variables.</div>}
+          {workspace && <div className="workspace-settings"><strong>Workspace settings</strong><label>History entries<input min="0" type="number" value={workspace.settings.historyLimit} onChange={(event) => saveWorkspaceSettings({ ...workspace.settings, historyLimit: Number(event.target.value) })} /></label><label>Log limit (MB)<input min="1" type="number" value={workspace.settings.logLimitMb} onChange={(event) => saveWorkspaceSettings({ ...workspace.settings, logLimitMb: Number(event.target.value) })} /></label><label><input checked={workspace.settings.autosave} onChange={(event) => saveWorkspaceSettings({ ...workspace.settings, autosave: event.target.checked })} type="checkbox" /> Autosave saved requests</label></div>}
         </div>}
         <div className="privacy-note"><strong>Your data stays here.</strong><span>No account, cloud, or telemetry.</span></div>
       </aside>
@@ -1270,12 +1242,12 @@ function App() {
         <form className="request-panel" onSubmit={sendRequest}>
           <div className="request-line">
             <input className="request-name" value={requestName} onChange={(event) => { setRequestName(event.target.value); setSaved(false); }} aria-label="Request name" />
-            <select className="collection-select" value={collectionId} onChange={(event) => { setCollectionId(event.target.value); setSaved(false); }} aria-label="Collection">{workspace?.collections.map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}</select>
+            <select className="collection-select" value={collectionId} onChange={(event) => { setCollectionId(event.target.value); setSaved(false); }} aria-label="Collection">{workspace?.collections.map((collection) => <option key={collection.id} value={collection.id}>{collectionPath(collection)}</option>)}</select>
             <button className={`favorite-button ${favorite ? "active" : ""}`} onClick={() => { setFavorite((current) => !current); setSaved(false); }} type="button" aria-label={favorite ? "Remove from favorites" : "Add to favorites"}>{favorite ? "★" : "☆"}</button>
             <select value={method} onChange={(event) => setMethod(event.target.value)} aria-label="HTTP method">{["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].map((item) => <option key={item}>{item}</option>)}</select>
             <div className="url-field"><input value={url} onChange={(event) => setUrl(event.target.value)} aria-label="Request URL" />{urlVariables.length > 0 && <div className="url-variables">{urlVariables.map((variable, index) => <span className={variable.source ? "" : "unresolved"} title={variable.source ? `${variable.name} supplied by ${variable.source}` : `${variable.name} is unresolved`} key={`${variable.name}-${index}`}>{`{{${variable.name}}}`} · {variable.source ?? "unresolved"}</span>)}</div>}</div>
             <button className="save-button" onClick={saveRequest} type="button">Save</button>
-            {sending ? <button className="cancel-button" onClick={cancelRequest} type="button">Cancel</button> : <button className="send-button" type="submit">Send</button>}
+            {sending ? <button className="cancel-button" onClick={cancelRequest} type="button">Cancel</button> : <button className="send-button" disabled={runningCollection} type="submit">Send</button>}
           </div>
 
           <div className="panel-tabs" role="tablist" aria-label="Request options" onKeyDown={handleTabKeyDown}>
@@ -1321,7 +1293,7 @@ function App() {
             )}
             {requestTab === "Scripts" && <div className="script-editor">
               <label className="script-toggle"><input checked={scriptsEnabled} onChange={(event) => setScriptsEnabled(event.target.checked)} type="checkbox" /><span>Enable scripts for this request</span></label>
-              <p>Scripts run locally in an isolated worker with network APIs removed and a one-second limit. Imported scripts stay disabled.</p>
+              <p>Scripts run locally in an isolated worker with network, storage, worker creation, dynamic imports, and eval removed, with a one-second limit. Scripts are marked as failed compatibility checks in CLI runs; use friendly assertions for CI.</p>
               <label><span>Pre-request JavaScript</span><textarea aria-label="Pre-request JavaScript" value={preRequestScript} onChange={(event) => setPreRequestScript(event.target.value)} placeholder={'request.headers.push({ name: "X-Run", value: "test", enabled: true });'} spellCheck={false} /></label>
               <label><span>Post-response JavaScript</span><textarea aria-label="Post-response JavaScript" value={postResponseScript} onChange={(event) => setPostResponseScript(event.target.value)} placeholder={'lantern.test("status is 200", () => lantern.expect(response.status).toEqual(200));'} spellCheck={false} /></label>
             </div>}
@@ -1329,15 +1301,15 @@ function App() {
               <div className="editor-toolbar"><strong>Friendly assertions</strong><button type="button" onClick={() => setAssertions((current) => [...current, { id: crypto.randomUUID(), kind: "status", operator: "equals", target: "", expected: "200", enabled: true }])}>+ Add assertion</button></div>
               {assertions.map((assertion) => <div className="assertion-row" key={assertion.id}>
                 <input checked={assertion.enabled} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, enabled: event.target.checked } : item))} type="checkbox" aria-label="Enable assertion" />
-                <select value={assertion.kind} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, kind: event.target.value as RequestAssertion["kind"] } : item))}><option value="status">Status</option><option value="header">Header</option><option value="json-path">JSON path</option><option value="response-time">Response time</option><option value="body">Body</option></select>
-                <input value={assertion.target} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, target: event.target.value } : item))} placeholder={assertion.kind === "header" ? "Header name" : assertion.kind === "json-path" ? "$.data.id" : "Target (optional)"} />
-                <select value={assertion.operator} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, operator: event.target.value as RequestAssertion["operator"] } : item))}><option value="equals">Equals</option><option value="not-equals">Not equals</option><option value="contains">Contains</option><option value="exists">Exists</option><option value="less-than">Less than</option></select>
-                <input value={assertion.expected} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, expected: event.target.value } : item))} placeholder="Expected value" />
+                <select value={assertion.kind} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, kind: event.target.value as RequestAssertion["kind"], operator: assertionOperators(event.target.value as RequestAssertion["kind"])[0] } : item))}><option value="status">Status</option><option value="header">Header</option><option value="json-path">JSON path</option><option value="response-time">Response time</option><option value="body">Body</option></select>
+                <input disabled={!["header", "json-path"].includes(assertion.kind)} value={assertion.target} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, target: event.target.value } : item))} placeholder={assertion.kind === "header" ? "Header name" : assertion.kind === "json-path" ? "$.data.items[0].id" : "No target needed"} />
+                <select value={assertion.operator} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, operator: event.target.value as RequestAssertion["operator"] } : item))}>{assertionOperators(assertion.kind).map((operator) => <option key={operator} value={operator}>{operator.replace("-", " ")}</option>)}</select>
+                <input disabled={assertion.operator === "exists"} value={assertion.expected} onChange={(event) => setAssertions((current) => current.map((item) => item.id === assertion.id ? { ...item, expected: event.target.value } : item))} placeholder={assertion.operator === "exists" ? "Not required" : "Expected value"} title={assertionError(assertion)} />
                 <button className="row-remove" type="button" onClick={() => setAssertions((current) => current.filter((item) => item.id !== assertion.id))} aria-label="Remove assertion">×</button>
               </div>)}
               {!assertions.length && <div className="empty-state">Add assertions for status, headers, JSON paths, body content, or timing.</div>}
             </div>}
-            {requestTab === "Settings" && <div className="settings-grid"><label><span>Timeout (milliseconds)</span><input min="1" type="number" value={timeoutMs} onChange={(event) => setTimeoutMs(Number(event.target.value))} /></label><label className="check-setting"><input checked={followRedirects} onChange={(event) => setFollowRedirects(event.target.checked)} type="checkbox" /><span>Follow redirects (up to 10)</span></label>{workspace && <><label><span>History entries</span><input min="0" type="number" value={workspace.settings.historyLimit} onChange={(event) => { const settings = { ...workspace.settings, historyLimit: Number(event.target.value) }; setWorkspace({ ...workspace, settings }); invoke("save_workspace_settings", { settings }); }} /></label><label><span>Log limit (MB)</span><input min="1" type="number" value={workspace.settings.logLimitMb} onChange={(event) => { const settings = { ...workspace.settings, logLimitMb: Number(event.target.value) }; setWorkspace({ ...workspace, settings }); invoke("save_workspace_settings", { settings }); }} /></label><label className="check-setting"><input checked={workspace.settings.autosave} onChange={(event) => { const settings = { ...workspace.settings, autosave: event.target.checked }; setWorkspace({ ...workspace, settings }); invoke("save_workspace_settings", { settings }); }} type="checkbox" /><span>Autosave saved requests</span></label></>}</div>}
+            {requestTab === "Settings" && <div className="settings-grid"><label><span>Timeout (milliseconds)</span><input min="1" type="number" value={timeoutMs} onChange={(event) => setTimeoutMs(Math.max(1, Number(event.target.value) || 1))} /></label><label className="check-setting"><input checked={followRedirects} onChange={(event) => setFollowRedirects(event.target.checked)} type="checkbox" /><span>Follow redirects (up to 10)</span></label></div>}
           </div>
         </form>
 
@@ -1348,11 +1320,11 @@ function App() {
           </div>
           {error && <div className="error-box"><strong>Request failed</strong><span>{error}</span></div>}
           {!response && !error && <div className="empty-response">Send a request to see the response.</div>}
-          {response && responseTab === "Body" && <><div className="response-tools"><div><button className={responseView === "pretty" ? "active" : ""} onClick={() => setResponseView("pretty")} type="button">Pretty</button><button className={responseView === "raw" ? "active" : ""} onClick={() => setResponseView("raw")} type="button">Raw</button><button className={responseView === "preview" ? "active" : ""} onClick={() => setResponseView("preview")} type="button">Preview</button>{response.content_type.includes("json") && <button className={responseTree ? "active" : ""} onClick={() => setResponseTree((current) => !current)} type="button">Tree</button>}</div><label><input aria-label="Search response" value={responseSearch} onChange={(event) => setResponseSearch(event.target.value)} placeholder="Search response" /><span>{responseSearch ? `${searchMatches} matches` : ""}</span></label><button type="button" onClick={() => navigator.clipboard.writeText(response.body)}>Copy</button><button type="button" onClick={saveResponse}>Save</button></div>{responseView === "preview" ? <div className="response-preview">{response.content_type.startsWith("image/") ? <img src={`data:${response.content_type};base64,${response.body_base64}`} alt="Response preview" /> : response.content_type.includes("html") ? <iframe srcDoc={response.body} sandbox="" title="Response preview" /> : <div className="empty-state">Preview is available for HTML and image responses.</div>}</div> : responseTree ? <JsonTreeBody body={response.body} /> : responseView === "pretty" && response.content_type.includes("json") ? <HighlightedJson body={responseBody} /> : <pre>{responseBody}</pre>}</>}
+          {response && responseTab === "Body" && <><div className="response-tools"><div><button className={responseView === "pretty" ? "active" : ""} onClick={() => setResponseView("pretty")} type="button">Pretty</button><button className={responseView === "raw" ? "active" : ""} onClick={() => setResponseView("raw")} type="button">Raw</button><button className={responseView === "preview" ? "active" : ""} onClick={() => setResponseView("preview")} type="button">Preview</button>{response.content_type.includes("json") && <button className={responseTree ? "active" : ""} onClick={() => setResponseTree((current) => !current)} type="button">Tree</button>}</div><label><input aria-label="Search response" value={responseSearch} onChange={(event) => setResponseSearch(event.target.value)} placeholder="Search response" /><span>{responseSearch ? `${searchMatches} matches` : ""}</span></label><button type="button" onClick={() => navigator.clipboard.writeText(response.body).then(() => setNotice("Copied response.")).catch((copyError) => setError(String(copyError)))}>Copy</button><button type="button" onClick={saveResponse}>Save</button></div>{responseView === "preview" ? <div className="response-preview">{response.content_type.startsWith("image/") ? <img src={`data:${response.content_type};base64,${response.body_base64}`} alt="Response preview" /> : response.content_type.includes("html") ? <iframe srcDoc={response.body} sandbox="" title="Response preview" /> : <div className="empty-state">Preview is available for HTML and image responses.</div>}</div> : responseTree ? <JsonTreeBody body={response.body} /> : responseView === "pretty" && response.content_type.includes("json") ? <HighlightedJson body={responseBody} /> : <pre>{responseBody}</pre>}</>}
           {response && responseTab === "Headers" && <div className="response-headers">{response.headers.map((header, index) => <div key={`${header.name}-${index}`}><strong>{header.name}</strong><span>{header.value}</span></div>)}</div>}
           {response && responseTab === "Cookies" && <div className="response-cookies">{cookies.length ? cookies.map((cookie, index) => <div key={`${cookie.name}-${index}`}><strong>{cookie.name}</strong><span>{cookie.value}</span><small>{cookie.attributes || "No attributes"}</small></div>) : <div className="empty-state">This response did not set any cookies.</div>}</div>}
           {responseTab === "Tests" && <div className="test-results">{testResults.length ? testResults.map((test, index) => <div className={test.passed ? "test-pass" : "test-fail"} key={`${test.name}-${index}`}><strong>{test.passed ? "PASS" : "FAIL"}</strong><span>{test.name}</span><small>{test.message}</small></div>) : <div className="empty-state">Send this request to run its assertions and enabled scripts.</div>}</div>}
-          {responseTab === "Runner" && <div className="runner-results">{runningCollection ? <div className="empty-state">Running collection...</div> : runReport ? <><div className="runner-summary"><strong>{runReport.collection}</strong><span>{runReport.passed} passed · {runReport.failed} failed · {runReport.elapsed_ms} ms</span><button type="button" onClick={() => exportRunReport("json")}>Save JSON</button><button type="button" onClick={() => exportRunReport("junit")}>Save JUnit</button></div>{runReport.items.map((item) => <div className={item.error || item.tests.some((test) => !test.passed) ? "run-fail" : "run-pass"} key={item.request_id}><strong>{item.method} {item.name}</strong><span>{item.status ?? "Error"} · {item.elapsed_ms} ms · {item.tests.filter((test) => test.passed).length}/{item.tests.length} tests</span><small>{item.error}</small></div>)}</> : <div className="empty-state">Use the play button beside a collection to run all of its requests.</div>}</div>}
+          {responseTab === "Runner" && <div className="runner-results">{runningCollection ? <div className="runner-summary"><strong>Running collection</strong><span>{runnerProgress}</span><button type="button" onClick={cancelCollectionRun}>Cancel</button></div> : runReport ? <><div className="runner-summary"><strong>{runReport.collection}</strong><span>{runReport.passed} passed · {runReport.failed} failed · {runReport.elapsed_ms} ms</span><button type="button" onClick={() => exportRunReport("json")}>Save JSON</button><button type="button" onClick={() => exportRunReport("junit")}>Save JUnit</button></div>{runReport.items.map((item) => <details className={item.error || item.tests.some((test) => !test.passed) ? "run-fail" : "run-pass"} key={item.request_id}><summary><strong>{item.method} {item.name}</strong><span>{item.status ?? "Error"} · {item.elapsed_ms} ms · {item.tests.filter((test) => test.passed).length}/{item.tests.length} tests</span></summary><small>{item.url}</small>{item.error && <small>{item.error}</small>}{item.tests.filter((test) => !test.passed).map((test, index) => <small key={`${test.name}-${index}`}>{test.name}: {test.message}</small>)}</details>)}</> : <div className="empty-state">Use the play button beside a collection to run all of its requests.</div>}</div>}
         </section>
       </section>
       {undoAction && <div className="undo-toast"><span>{undoAction.message}</span><button type="button" onClick={() => undoAction.run().then(() => setUndoAction(null))}>Undo</button><button aria-label="Dismiss undo" type="button" onClick={() => setUndoAction(null)}>×</button></div>}

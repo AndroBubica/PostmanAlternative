@@ -103,6 +103,8 @@ pub struct HistoryEntry {
     pub status: Option<u16>,
     pub elapsed_ms: Option<u128>,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_snapshot: Option<SavedRequest>,
 }
 
 #[derive(Serialize)]
@@ -115,6 +117,12 @@ pub struct WorkspaceSnapshot {
     pub history: Vec<HistoryEntry>,
     pub settings: WorkspaceSettings,
     pub global_variables: Vec<Variable>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct DeletedCollectionSnapshot {
+    pub collections: Vec<Collection>,
+    pub requests: Vec<SavedRequest>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -411,7 +419,10 @@ fn validate_collection_parent(
     Ok(())
 }
 
-pub fn delete_collection(app: &AppHandle, collection_id: &str) -> Result<(), String> {
+pub fn delete_collection(
+    app: &AppHandle,
+    collection_id: &str,
+) -> Result<DeletedCollectionSnapshot, String> {
     if collection_id == "default" {
         return Err("The default collection cannot be deleted.".into());
     }
@@ -420,6 +431,17 @@ pub fn delete_collection(app: &AppHandle, collection_id: &str) -> Result<(), Str
     let collections: Vec<Collection> = read_json_files(&root.join("collections"));
     let delete_ids = collection_descendant_ids(&collections, collection_id);
     let requests: Vec<SavedRequest> = read_json_files(&root.join("requests"));
+    let snapshot = DeletedCollectionSnapshot {
+        collections: collections
+            .into_iter()
+            .filter(|collection| delete_ids.contains(&collection.id))
+            .collect(),
+        requests: requests
+            .iter()
+            .filter(|request| delete_ids.contains(&request.collection_id))
+            .cloned()
+            .collect(),
+    };
     for request in requests {
         if delete_ids.contains(&request.collection_id) {
             let path = root.join("requests").join(format!("{}.json", request.id));
@@ -433,6 +455,45 @@ pub fn delete_collection(app: &AppHandle, collection_id: &str) -> Result<(), Str
             fs::remove_file(path)
                 .map_err(|error| format!("Could not delete collection folder. ({error})"))?;
         }
+    }
+    Ok(snapshot)
+}
+
+pub fn restore_collection(
+    app: &AppHandle,
+    snapshot: &DeletedCollectionSnapshot,
+) -> Result<(), String> {
+    let (root, _) = workspace_root(app)?;
+    ensure_workspace(&root)?;
+    let mut remaining = snapshot.collections.clone();
+    let snapshot_ids = remaining
+        .iter()
+        .map(|collection| collection.id.clone())
+        .collect::<Vec<_>>();
+    let mut restored = Vec::new();
+    while !remaining.is_empty() {
+        let index = remaining
+            .iter()
+            .position(|collection| {
+                collection.parent_id.as_ref().map_or(true, |parent| {
+                    !snapshot_ids.contains(parent) || restored.contains(parent)
+                })
+            })
+            .ok_or_else(|| "Could not restore the collection hierarchy.".to_string())?;
+        let collection = remaining.remove(index);
+        atomic_json(
+            &root
+                .join("collections")
+                .join(format!("{}.json", collection.id)),
+            &collection,
+        )?;
+        restored.push(collection.id);
+    }
+    for request in &snapshot.requests {
+        atomic_json(
+            &root.join("requests").join(format!("{}.json", request.id)),
+            request,
+        )?;
     }
     Ok(())
 }
