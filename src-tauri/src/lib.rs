@@ -8,6 +8,8 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+mod commands;
+pub mod runner;
 mod vault;
 pub mod workspace;
 
@@ -260,89 +262,6 @@ fn cancel_request(request_id: String, state: tauri::State<'_, RequestState>) -> 
     Ok(())
 }
 
-#[tauri::command]
-fn load_workspace(app: tauri::AppHandle) -> Result<workspace::WorkspaceSnapshot, String> {
-    workspace::load(&app)
-}
-
-#[tauri::command]
-fn save_workspace_request(
-    app: tauri::AppHandle,
-    request: workspace::SavedRequest,
-) -> Result<(), String> {
-    workspace::save_request(&app, &request)
-}
-
-#[tauri::command]
-fn delete_workspace_request(app: tauri::AppHandle, request_id: String) -> Result<(), String> {
-    workspace::delete_request(&app, &request_id)
-}
-
-#[tauri::command]
-fn create_workspace_collection(
-    app: tauri::AppHandle,
-    name: String,
-    parent_id: Option<String>,
-) -> Result<workspace::Collection, String> {
-    workspace::create_collection(&app, &name, parent_id)
-}
-
-#[tauri::command]
-fn save_workspace_collection(
-    app: tauri::AppHandle,
-    collection: workspace::Collection,
-) -> Result<(), String> {
-    workspace::save_collection(&app, &collection)
-}
-
-#[tauri::command]
-fn delete_workspace_collection(
-    app: tauri::AppHandle,
-    collection_id: String,
-) -> Result<workspace::DeletedCollectionSnapshot, String> {
-    workspace::delete_collection(&app, &collection_id)
-}
-
-#[tauri::command]
-fn restore_workspace_collection(
-    app: tauri::AppHandle,
-    snapshot: workspace::DeletedCollectionSnapshot,
-) -> Result<(), String> {
-    workspace::restore_collection(&app, &snapshot)
-}
-
-#[tauri::command]
-fn save_workspace_environment(
-    app: tauri::AppHandle,
-    environment: workspace::Environment,
-) -> Result<(), String> {
-    workspace::save_environment(&app, &environment)
-}
-
-#[tauri::command]
-fn delete_workspace_environment(
-    app: tauri::AppHandle,
-    environment_id: String,
-) -> Result<(), String> {
-    workspace::delete_environment(&app, &environment_id)
-}
-
-#[tauri::command]
-fn save_workspace_settings(
-    app: tauri::AppHandle,
-    settings: workspace::WorkspaceSettings,
-) -> Result<(), String> {
-    workspace::save_settings(&app, &settings)
-}
-
-#[tauri::command]
-fn save_workspace_globals(
-    app: tauri::AppHandle,
-    variables: Vec<workspace::Variable>,
-) -> Result<(), String> {
-    workspace::save_globals(&app, &variables)
-}
-
 fn vault_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(workspace::workspace_root(app)?
         .0
@@ -448,27 +367,6 @@ fn lock_vault(state: tauri::State<'_, VaultState>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn add_workspace_history(
-    app: tauri::AppHandle,
-    entry: workspace::HistoryEntry,
-) -> Result<(), String> {
-    workspace::add_history(&app, &entry)
-}
-
-#[tauri::command]
-fn import_workspace_file(
-    app: tauri::AppHandle,
-    path: String,
-) -> Result<workspace::ImportResult, String> {
-    workspace::import_file(&app, &path)
-}
-
-#[tauri::command]
-fn export_portable_workspace(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    workspace::export_portable(&app, &path)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -481,24 +379,24 @@ pub fn run() {
             cancel_request,
             save_response,
             save_text_file,
-            load_workspace,
-            save_workspace_request,
-            delete_workspace_request,
-            create_workspace_collection,
-            save_workspace_collection,
-            delete_workspace_collection,
-            restore_workspace_collection,
-            save_workspace_environment,
-            delete_workspace_environment,
-            save_workspace_settings,
-            save_workspace_globals,
+            commands::workspace::load_workspace,
+            commands::workspace::save_workspace_request,
+            commands::workspace::delete_workspace_request,
+            commands::workspace::create_workspace_collection,
+            commands::workspace::save_workspace_collection,
+            commands::workspace::delete_workspace_collection,
+            commands::workspace::restore_workspace_collection,
+            commands::workspace::save_workspace_environment,
+            commands::workspace::delete_workspace_environment,
+            commands::workspace::save_workspace_settings,
+            commands::workspace::save_workspace_globals,
             unlock_vault,
             save_vault,
             mutate_vault_entry,
             lock_vault,
-            add_workspace_history,
-            import_workspace_file,
-            export_portable_workspace
+            commands::workspace::add_workspace_history,
+            commands::workspace::import_workspace_file,
+            commands::workspace::export_portable_workspace
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

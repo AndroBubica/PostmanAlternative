@@ -1,7 +1,12 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+import { KeyValueTable, emptyRow } from "./components/KeyValueTable";
+import { HighlightedJson, JsonTreeBody, fileName, formatBytes, parseCookies, prettyBody, responseExtension } from "./components/responseFormat";
+import type {
+  ApiResponse, AuthType, BodyMode, Collection, DeletedCollectionSnapshot, Environment,
+  HistoryEntry, KeyValueRow, MultipartRow, OpenTab, RequestAssertion, ResponseView,
+  RunItem, RunReport, SavedRequest, TestResult, Variable, WorkspaceSnapshot,
+} from "./domain/types";
 import {
   assertionError,
   assertionOperators,
@@ -11,103 +16,9 @@ import {
   reportContents,
   requestToCurl,
 } from "./interface";
-
-type KeyValueRow = {
-  id: number;
-  name: string;
-  value: string;
-  enabled: boolean;
-};
-
-type ApiResponse = {
-  status: number;
-  status_text: string;
-  elapsed_ms: number;
-  size_bytes: number;
-  headers: Array<{ name: string; value: string }>;
-  body: string;
-  body_base64: string;
-  content_type: string;
-};
-
-type AuthType = "none" | "basic" | "bearer" | "api-key";
-type BodyMode = "json" | "text" | "xml" | "form" | "multipart" | "binary";
-type ResponseView = "pretty" | "raw" | "preview";
-type MultipartRow = KeyValueRow & { kind: "text" | "file" };
-type RequestAssertion = {
-  id: string;
-  kind: "status" | "header" | "json-path" | "response-time" | "body";
-  operator: "equals" | "not-equals" | "contains" | "exists" | "less-than";
-  target: string;
-  expected: string;
-  enabled: boolean;
-};
-type Collection = { id: string; name: string; parentId?: string; variables: Variable[] };
-type Variable = { name: string; value: string; secret: boolean; enabled: boolean };
-type Environment = { id: string; name: string; variables: Variable[] };
-type HistoryEntry = {
-  id: string;
-  request_id: string | null;
-  name: string;
-  method: string;
-  url: string;
-  status: number | null;
-  elapsed_ms: number | null;
-  created_at: number;
-  request_snapshot?: SavedRequest;
-};
-type SavedRequest = {
-  id: string;
-  collectionId: string;
-  name: string;
-  method: string;
-  url: string;
-  params: KeyValueRow[];
-  headers: KeyValueRow[];
-  body: string;
-  bodyMode: BodyMode;
-  formRows: KeyValueRow[];
-  multipartRows: MultipartRow[];
-  binaryFile: string;
-  authType: AuthType;
-  authFields: Record<string, string>;
-  timeoutMs: number;
-  followRedirects: boolean;
-  favorite: boolean;
-  preRequestScript: string;
-  postResponseScript: string;
-  scriptsEnabled: boolean;
-  assertions: RequestAssertion[];
-};
-type WorkspaceSnapshot = {
-  root: string;
-  portable: boolean;
-  collections: Collection[];
-  requests: SavedRequest[];
-  environments: Environment[];
-  history: HistoryEntry[];
-  settings: { historyLimit: number; logLimitMb: number; autosave: boolean };
-  global_variables: Variable[];
-};
-type DeletedCollectionSnapshot = { collections: Collection[]; requests: SavedRequest[] };
-
-type OpenTab = {
-  key: string;
-  request: SavedRequest;
-  response: ApiResponse | null;
-  error: string;
-  testResults: TestResult[];
-  responseTab: string;
-  responseView: ResponseView;
-  responseTree: boolean;
-  responseSearch: string;
-  requestTab: string;
-  saved: boolean;
-};
 type UndoAction = { message: string; run: () => Promise<void> };
-type TestResult = { name: string; passed: boolean; message: string };
-type RunItem = { request_id: string; name: string; method: string; url: string; status: number | null; elapsed_ms: number; tests: TestResult[]; error: string };
-type RunReport = { collection: string; started_at: string; elapsed_ms: number; passed: number; failed: number; items: RunItem[] };
+import { chooseInputFile, chooseOutputFile, nativeInvoke } from "./services/tauri";
+import { runSandboxScript } from "./services/sandbox";
 
 const methodColors: Record<string, string> = {
   GET: "method-get",
@@ -117,135 +28,7 @@ const methodColors: Record<string, string> = {
   DELETE: "method-delete",
 };
 
-const emptyRow = (): KeyValueRow => ({
-  id: Date.now() + Math.random(),
-  name: "",
-  value: "",
-  enabled: true,
-});
-
 const emptyMultipartRow = (): MultipartRow => ({ ...emptyRow(), kind: "text" });
-
-function fileName(path: string) {
-  return path.split(/[\\/]/).pop() || path;
-}
-
-function prettyBody(body: string) {
-  try {
-    return JSON.stringify(JSON.parse(body), null, 2);
-  } catch {
-    return body;
-  }
-}
-
-function JsonTree({ value, name }: { value: unknown; name?: string }) {
-  if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>);
-    return <details open className="json-node"><summary>{name && <strong>{name}: </strong>}{Array.isArray(value) ? `[${entries.length}]` : `{${entries.length}}`}</summary>{entries.map(([key, child]) => <JsonTree key={key} name={key} value={child} />)}</details>;
-  }
-  return <div className="json-leaf">{name && <strong>{name}: </strong>}<span className={`json-${value === null ? "null" : typeof value}`}>{JSON.stringify(value)}</span></div>;
-}
-
-function HighlightedJson({ body }: { body: string }) {
-  const highlighted = body.replace(/(&|<|>)/g, (value) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[value]!)
-    .replace(/("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*")(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g, (match, string, key) => `<span class="${key ? "json-key" : string ? "json-string" : /true|false/.test(match) ? "json-boolean" : /null/.test(match) ? "json-null" : "json-number"}">${match}</span>`);
-  return <pre dangerouslySetInnerHTML={{ __html: highlighted }} />;
-}
-
-function JsonTreeBody({ body }: { body: string }) {
-  try {
-    return <div className="json-tree"><JsonTree value={JSON.parse(body)} /></div>;
-  } catch {
-    return <pre>{body}</pre>;
-  }
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function parseCookies(headers: ApiResponse["headers"]) {
-  return headers
-    .filter((header) => header.name.toLowerCase() === "set-cookie")
-    .map((header) => {
-      const [pair, ...attributes] = header.value.split(";").map((part) => part.trim());
-      const separator = pair.indexOf("=");
-      return {
-        name: separator >= 0 ? pair.slice(0, separator) : pair,
-        value: separator >= 0 ? pair.slice(separator + 1) : "",
-        attributes: attributes.join("; "),
-      };
-    });
-}
-
-function responseExtension(contentType: string) {
-  if (contentType.includes("json")) return "json";
-  if (contentType.includes("html")) return "html";
-  if (contentType.includes("xml")) return "xml";
-  if (contentType.includes("png")) return "png";
-  if (contentType.includes("jpeg")) return "jpg";
-  if (contentType.includes("gif")) return "gif";
-  if (contentType.includes("svg")) return "svg";
-  if (contentType.startsWith("text/")) return "txt";
-  return "bin";
-}
-
-function KeyValueTable({
-  rows,
-  setRows,
-  label,
-}: {
-  rows: KeyValueRow[];
-  setRows: React.Dispatch<React.SetStateAction<KeyValueRow[]>>;
-  label: string;
-}) {
-  function updateRow(id: number, field: keyof KeyValueRow, value: string | boolean) {
-    setRows((current) =>
-      current.map((row) => (row.id === id ? { ...row, [field]: value } : row)),
-    );
-  }
-
-  return (
-    <div className="key-value-table">
-      <div className="table-labels"><span /><span>Key</span><span>Value</span><span /></div>
-      {rows.map((row) => (
-        <div className="key-value-row" key={row.id}>
-          <input
-            checked={row.enabled}
-            onChange={(event) => updateRow(row.id, "enabled", event.target.checked)}
-            type="checkbox"
-            aria-label={`Enable ${row.name || label}`}
-          />
-          <input
-            value={row.name}
-            onChange={(event) => updateRow(row.id, "name", event.target.value)}
-            placeholder={`${label} name`}
-            aria-label={`${label} name`}
-          />
-          <input
-            value={row.value}
-            onChange={(event) => updateRow(row.id, "value", event.target.value)}
-            placeholder="Value"
-            aria-label={`${label} value`}
-          />
-          <button
-            type="button"
-            className="row-remove"
-            onClick={() => setRows((current) => current.filter((item) => item.id !== row.id))}
-            aria-label={`Remove ${label}`}
-          >
-            ×
-          </button>
-        </div>
-      ))}
-      <button className="add-row" type="button" onClick={() => setRows((current) => [...current, emptyRow()])}>
-        + Add {label.toLowerCase()}
-      </button>
-    </div>
-  );
-}
 
 function App() {
   const [requestId, setRequestId] = useState("");
@@ -310,7 +93,7 @@ function App() {
   }
 
   async function refreshWorkspace() {
-    const loaded = await invoke<WorkspaceSnapshot>("load_workspace");
+    const loaded = await nativeInvoke<WorkspaceSnapshot>("load_workspace");
     setWorkspace(loaded);
     if (!activeEnvironmentId && loaded.environments.length) setActiveEnvironmentId(loaded.environments[0].id);
   }
@@ -340,7 +123,7 @@ function App() {
     const timer = window.setTimeout(() => {
       const request = currentRequest();
       setPendingWrites((count) => count + 1);
-      invoke("save_workspace_request", { request }).then(() => {
+      nativeInvoke("save_workspace_request", { request }).then(() => {
         setSaved(true);
         setNotice(`Autosaved "${request.name}".`);
         refreshWorkspace().catch(() => undefined);
@@ -398,65 +181,6 @@ function App() {
     return buildSharedRequest(currentRequest(), variableValues());
   }
 
-  function runSandboxScript(
-    script: string,
-    context: { request: Record<string, unknown>; response: ApiResponse | null; variables: Record<string, string> },
-  ): Promise<{ request: Record<string, unknown>; variables: Record<string, string>; tests: TestResult[] }> {
-    const workerSource = `
-      const ScriptFunction = Function;
-      self.fetch = undefined; self.XMLHttpRequest = undefined; self.WebSocket = undefined; self.EventSource = undefined;
-      self.WebTransport = undefined; self.Worker = undefined; self.SharedWorker = undefined; self.importScripts = undefined;
-      self.indexedDB = undefined; self.caches = undefined; self.eval = undefined; self.Function = undefined;
-      self.onmessage = ({ data }) => {
-        const tests = [];
-        const lantern = {
-          setVariable(name, value) { data.variables[String(name)] = String(value); },
-          getVariable(name) { return data.variables[String(name)]; },
-          test(name, fn) {
-            try { fn(); tests.push({ name: String(name), passed: true, message: "" }); }
-            catch (error) { tests.push({ name: String(name), passed: false, message: String(error?.message || error) }); }
-          },
-          expect(value) {
-            return {
-              toEqual(expected) { if (value !== expected) throw new Error(JSON.stringify(value) + " did not equal " + JSON.stringify(expected)); },
-              toContain(expected) { if (!String(value).includes(String(expected))) throw new Error(JSON.stringify(value) + " did not contain " + JSON.stringify(expected)); },
-              toBeLessThan(expected) { if (!(Number(value) < Number(expected))) throw new Error(value + " was not less than " + expected); }
-            };
-          }
-        };
-        try {
-          ScriptFunction("lantern", "request", "response", "variables", '"use strict";\\n' + data.script)(lantern, data.request, data.response, data.variables);
-          self.postMessage({ request: data.request, variables: data.variables, tests });
-        } catch (error) {
-          self.postMessage({ error: String(error?.message || error), request: data.request, variables: data.variables, tests });
-        }
-      };
-    `;
-    return new Promise((resolve, reject) => {
-      const objectUrl = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
-      const worker = new Worker(objectUrl);
-      const timeout = window.setTimeout(() => {
-        worker.terminate();
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error("Script stopped after the 1 second sandbox limit."));
-      }, 1000);
-      worker.onmessage = (event) => {
-        window.clearTimeout(timeout);
-        worker.terminate();
-        URL.revokeObjectURL(objectUrl);
-        if (event.data.error) reject(new Error(event.data.error));
-        else resolve(event.data);
-      };
-      worker.onerror = (event) => {
-        window.clearTimeout(timeout);
-        worker.terminate();
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error(event.message));
-      };
-      worker.postMessage({ script, ...context });
-    });
-  }
-
   function variableValues(requestCollectionId = collectionId) {
     const values: Record<string, string> = {};
     const add = (variables: Variable[]) => variables.filter((variable) => variable.enabled && variable.name).forEach((variable) => {
@@ -495,7 +219,7 @@ function App() {
           scriptResults = [{ name: "Pre-request script", passed: false, message: String(scriptError) }];
         }
       }
-      const result = await invoke<ApiResponse>("send_request", {
+      const result = await nativeInvoke<ApiResponse>("send_request", {
         request: {
           id: transportRequestId,
           method,
@@ -527,7 +251,7 @@ function App() {
         created_at: Date.now(),
         request_snapshot: currentRequest(),
       };
-      await invoke("add_workspace_history", { entry });
+      await nativeInvoke("add_workspace_history", { entry });
       await refreshWorkspace();
     } catch (requestError) {
       if (!response) setTestResults([]);
@@ -540,7 +264,7 @@ function App() {
 
   async function cancelRequest() {
     if (activeRequestId.current) {
-      await invoke("cancel_request", { requestId: activeRequestId.current });
+      await nativeInvoke("cancel_request", { requestId: activeRequestId.current });
     }
   }
 
@@ -549,7 +273,7 @@ function App() {
   }
 
   async function chooseFile(onSelected: (path: string) => void) {
-    const selected = await open({ multiple: false, directory: false });
+    const selected = await chooseInputFile();
     if (selected) onSelected(selected);
   }
 
@@ -582,7 +306,7 @@ function App() {
   async function saveRequest() {
     const request = currentRequest();
     setPendingWrites((count) => count + 1);
-    try { await invoke("save_workspace_request", { request }); }
+    try { await nativeInvoke("save_workspace_request", { request }); }
     finally { setPendingWrites((count) => count - 1); }
     setRequestId(request.id);
     setRequestName(request.name);
@@ -713,7 +437,7 @@ function App() {
   async function createCollection(parentId?: string) {
     const name = window.prompt(parentId ? "Folder name" : "Collection name");
     if (!name?.trim()) return;
-    const collection = await invoke<Collection>("create_workspace_collection", { name, parentId });
+    const collection = await nativeInvoke<Collection>("create_workspace_collection", { name, parentId });
     setCollectionId(collection.id);
     await refreshWorkspace();
   }
@@ -721,7 +445,7 @@ function App() {
   async function renameCollection(collection: Collection) {
     const name = window.prompt("Rename collection folder", collection.name);
     if (!name?.trim() || name.trim() === collection.name) return;
-    await invoke("save_workspace_collection", { collection: { ...collection, name: name.trim() } });
+    await nativeInvoke("save_workspace_collection", { collection: { ...collection, name: name.trim() } });
     await refreshWorkspace();
   }
 
@@ -760,21 +484,21 @@ function App() {
       return;
     }
     const parentId = index === 0 ? undefined : destinations[index - 1].id;
-    await invoke("save_workspace_collection", { collection: { ...collection, parentId } });
+    await nativeInvoke("save_workspace_collection", { collection: { ...collection, parentId } });
     setNotice(`Moved "${collection.name}" to ${choices[index]}.`);
     await refreshWorkspace();
   }
 
   async function deleteCollection(collection: Collection) {
     if (!window.confirm(`Delete "${collection.name}" and every request and folder inside it?`)) return;
-    const snapshot = await invoke<DeletedCollectionSnapshot>("delete_workspace_collection", { collectionId: collection.id });
+    const snapshot = await nativeInvoke<DeletedCollectionSnapshot>("delete_workspace_collection", { collectionId: collection.id });
     const deletedRequestIds = new Set(snapshot.requests.map((request) => request.id));
     setOpenTabs((current) => current.filter((tab) => !deletedRequestIds.has(tab.request.id)));
     if (deletedRequestIds.has(requestId)) newRequest();
     if (collectionId === collection.id) setCollectionId("default");
     setNotice(`Deleted "${collection.name}".`);
     setUndoAction({ message: `Restore "${collection.name}"`, run: async () => {
-      await invoke("restore_workspace_collection", { snapshot });
+      await nativeInvoke("restore_workspace_collection", { snapshot });
       await refreshWorkspace();
     } });
     await refreshWorkspace();
@@ -782,26 +506,26 @@ function App() {
 
   async function duplicateRequest(request: SavedRequest) {
     const duplicate = { ...request, id: crypto.randomUUID(), name: `${request.name} copy` };
-    await invoke("save_workspace_request", { request: duplicate });
+    await nativeInvoke("save_workspace_request", { request: duplicate });
     setNotice(`Duplicated "${request.name}".`);
     await refreshWorkspace();
   }
 
   async function deleteRequest(request: SavedRequest) {
     if (!window.confirm(`Delete "${request.name}"?`)) return;
-    await invoke("delete_workspace_request", { requestId: request.id });
+    await nativeInvoke("delete_workspace_request", { requestId: request.id });
     if (requestId === request.id) newRequest();
     setOpenTabs((current) => current.filter((tab) => tab.request.id !== request.id));
     setNotice(`Deleted "${request.name}".`);
     setUndoAction({ message: `Restore "${request.name}"`, run: async () => {
-      await invoke("save_workspace_request", { request });
+      await nativeInvoke("save_workspace_request", { request });
       await refreshWorkspace();
     } });
     await refreshWorkspace();
   }
 
   async function toggleFavorite(request: SavedRequest) {
-    await invoke("save_workspace_request", { request: { ...request, favorite: !request.favorite } });
+    await nativeInvoke("save_workspace_request", { request: { ...request, favorite: !request.favorite } });
     if (requestId === request.id) setFavorite(!request.favorite);
     await refreshWorkspace();
   }
@@ -826,7 +550,7 @@ function App() {
       setError("Choose a destination number from the move-request list.");
       return;
     }
-    await invoke("save_workspace_request", { request: { ...request, collectionId: workspace.collections[index].id } });
+    await nativeInvoke("save_workspace_request", { request: { ...request, collectionId: workspace.collections[index].id } });
     setNotice(`Moved "${request.name}" to ${choices[index]}.`);
     await refreshWorkspace();
   }
@@ -871,7 +595,7 @@ function App() {
           }
           const transportId = crypto.randomUUID();
           activeRequestId.current = transportId;
-          const result = await invoke<ApiResponse>("send_request", { request: { id: transportId, method: savedRequest.method, ...built, timeout_ms: savedRequest.timeoutMs, follow_redirects: savedRequest.followRedirects } });
+          const result = await nativeInvoke<ApiResponse>("send_request", { request: { id: transportId, method: savedRequest.method, ...built, timeout_ms: savedRequest.timeoutMs, follow_redirects: savedRequest.followRedirects } });
           let tests = [...scriptTests, ...assertionResults(savedRequest.assertions ?? [], result)];
           if (savedRequest.scriptsEnabled && savedRequest.postResponseScript?.trim()) {
             try {
@@ -904,10 +628,10 @@ function App() {
 
   async function exportRunReport(format: "json" | "junit") {
     if (!runReport) return;
-    const path = await save({ defaultPath: `api-lantern-report.${format === "junit" ? "xml" : "json"}` });
+    const path = await chooseOutputFile({ defaultPath: `api-lantern-report.${format === "junit" ? "xml" : "json"}` });
     if (!path) return;
     const contents = reportContents(runReport, format);
-    await invoke("save_text_file", { path, contents });
+    await nativeInvoke("save_text_file", { path, contents });
     setNotice(`Saved ${format.toUpperCase()} report.`);
   }
 
@@ -943,9 +667,9 @@ function App() {
   }
 
   async function importFile() {
-    const path = await open({ multiple: false, directory: false, filters: [{ name: "API files", extensions: ["json", "yaml", "yml"] }] });
+    const path = await chooseInputFile({ filters: [{ name: "API files", extensions: ["json", "yaml", "yml"] }] });
     if (!path) return;
-    const result = await invoke<{ message: string }>("import_workspace_file", { path });
+    const result = await nativeInvoke<{ message: string }>("import_workspace_file", { path });
     setNotice(result.message);
     await refreshWorkspace();
   }
@@ -974,9 +698,9 @@ function App() {
   }
 
   async function exportPortable() {
-    const path = await save({ defaultPath: "api-lantern-portable-workspace.zip", filters: [{ name: "ZIP archive", extensions: ["zip"] }] });
+    const path = await chooseOutputFile({ defaultPath: "api-lantern-portable-workspace.zip", filters: [{ name: "ZIP archive", extensions: ["zip"] }] });
     if (!path) return;
-    await invoke("export_portable_workspace", { path });
+    await nativeInvoke("export_portable_workspace", { path });
     setNotice("Exported a portable workspace without secrets.");
   }
 
@@ -989,20 +713,20 @@ function App() {
   async function unlockVault() {
     const password = window.prompt("Vault password");
     if (!password) return;
-    const entries = await invoke<Record<string, string>>("unlock_vault", { password });
+    const entries = await nativeInvoke<Record<string, string>>("unlock_vault", { password });
     setVaultEntries(entries);
     setNotice("Secret vault unlocked.");
   }
 
   async function lockVault() {
-    await invoke("lock_vault");
+    await nativeInvoke("lock_vault");
     setVaultEntries(null);
     setNotice("Secret vault locked.");
   }
 
   async function saveVaultEntry(name: string, value: string) {
     setVaultEntries((current) => ({ ...current, [name]: value }));
-    const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", { operation: "set", oldName: name, newName: name, value }));
+    const entries = await queueWorkspaceWrite(() => nativeInvoke<Record<string, string>>("mutate_vault_entry", { operation: "set", oldName: name, newName: name, value }));
     setVaultEntries(entries);
   }
 
@@ -1024,7 +748,7 @@ function App() {
         }
         return entries;
       });
-      const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", { operation: "rename", oldName: variable.name, newName: name, value: "" }));
+      const entries = await queueWorkspaceWrite(() => nativeInvoke<Record<string, string>>("mutate_vault_entry", { operation: "rename", oldName: variable.name, newName: name, value: "" }));
       setVaultEntries(entries);
     }
     await metadataWrite;
@@ -1039,16 +763,16 @@ function App() {
     if (scope === "environment" && activeEnvironment) {
       const environment = { ...activeEnvironment, variables };
       setWorkspace((current) => current ? { ...current, environments: current.environments.map((item) => item.id === environment.id ? environment : item) } : current);
-      await queueWorkspaceWrite(() => invoke("save_workspace_environment", { environment }));
+      await queueWorkspaceWrite(() => nativeInvoke("save_workspace_environment", { environment }));
     }
     if (scope === "collection" && activeCollection) {
       const collection = { ...activeCollection, variables };
       setWorkspace((current) => current ? { ...current, collections: current.collections.map((item) => item.id === collection.id ? collection : item) } : current);
-      await queueWorkspaceWrite(() => invoke("save_workspace_collection", { collection }));
+      await queueWorkspaceWrite(() => nativeInvoke("save_workspace_collection", { collection }));
     }
     if (scope === "global") {
       setWorkspace((current) => current ? { ...current, global_variables: variables } : current);
-      await queueWorkspaceWrite(() => invoke("save_workspace_globals", { variables }));
+      await queueWorkspaceWrite(() => nativeInvoke("save_workspace_globals", { variables }));
     }
   }
 
@@ -1063,7 +787,7 @@ function App() {
     const name = window.prompt("Environment name");
     if (!name?.trim()) return;
     const environment: Environment = { id: crypto.randomUUID(), name: name.trim(), variables: [] };
-    await invoke("save_workspace_environment", { environment });
+    await nativeInvoke("save_workspace_environment", { environment });
     setActiveEnvironmentId(environment.id);
     await refreshWorkspace();
     setSidebarView("environment");
@@ -1082,14 +806,14 @@ function App() {
     const environment = activeEnvironment;
     setWorkspace((current) => current ? { ...current, environments: current.environments.filter((item) => item.id !== environment.id) } : current);
     setActiveEnvironmentId("");
-    await queueWorkspaceWrite(() => invoke("delete_workspace_environment", { environmentId: environment.id }));
+    await queueWorkspaceWrite(() => nativeInvoke("delete_workspace_environment", { environmentId: environment.id }));
     setNotice(`Deleted environment "${environment.name}".`);
     await refreshWorkspace();
   }
 
   async function updateEnvironment(environment: Environment) {
     setWorkspace((current) => current ? { ...current, environments: current.environments.map((item) => item.id === environment.id ? environment : item) } : current);
-    await queueWorkspaceWrite(() => invoke("save_workspace_environment", { environment }));
+    await queueWorkspaceWrite(() => nativeInvoke("save_workspace_environment", { environment }));
   }
 
   async function saveWorkspaceSettings(settings: WorkspaceSnapshot["settings"]) {
@@ -1098,7 +822,7 @@ function App() {
       return;
     }
     setWorkspace({ ...workspace, settings });
-    await queueWorkspaceWrite(() => invoke("save_workspace_settings", { settings }));
+    await queueWorkspaceWrite(() => nativeInvoke("save_workspace_settings", { settings }));
     setError("");
     setNotice("Saved workspace settings.");
   }
@@ -1118,7 +842,7 @@ function App() {
       }
       return { ...item, secret: true, value: "" };
     });
-    const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", {
+    const entries = await queueWorkspaceWrite(() => nativeInvoke<Record<string, string>>("mutate_vault_entry", {
       operation: variable.secret ? "plain" : "set", oldName: variable.name, newName: variable.name, value: variable.value,
     }));
     setVaultEntries(entries);
@@ -1134,7 +858,7 @@ function App() {
       return;
     }
     if (variable.secret && vaultEntries && variable.name in vaultEntries) {
-      const entries = await queueWorkspaceWrite(() => invoke<Record<string, string>>("mutate_vault_entry", { operation: "remove", oldName: variable.name, newName: "", value: "" }));
+      const entries = await queueWorkspaceWrite(() => nativeInvoke<Record<string, string>>("mutate_vault_entry", { operation: "remove", oldName: variable.name, newName: "", value: "" }));
       setVaultEntries(entries);
     }
     await updateVariables(variableScope, variablesForScope().filter((_item, itemIndex) => itemIndex !== index));
@@ -1160,11 +884,11 @@ function App() {
 
   async function saveResponse() {
     if (!response) return;
-    const path = await save({
+    const path = await chooseOutputFile({
       defaultPath: `response.${responseExtension(response.content_type)}`,
     });
     if (path) {
-      await invoke("save_response", { path, bodyBase64: response.body_base64 });
+      await nativeInvoke("save_response", { path, bodyBase64: response.body_base64 });
       setNotice("Saved response.");
     }
   }

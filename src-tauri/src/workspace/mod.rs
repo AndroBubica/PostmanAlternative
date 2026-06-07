@@ -1,168 +1,22 @@
+mod logging;
+mod models;
+mod portable_export;
+
+pub use logging::append_log;
+use logging::enforce_log_limit;
+pub use models::*;
+pub use portable_export::export_portable;
+#[cfg(test)]
+use portable_export::redact_export_bytes;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
-
-const DEFAULT_HISTORY_LIMIT: usize = 100;
-const DEFAULT_LOG_LIMIT_MB: usize = 10;
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct KeyValueRow {
-    pub id: f64,
-    pub name: String,
-    pub value: String,
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SavedRequest {
-    pub id: String,
-    pub collection_id: String,
-    pub name: String,
-    pub method: String,
-    pub url: String,
-    pub params: Vec<KeyValueRow>,
-    pub headers: Vec<KeyValueRow>,
-    pub body: String,
-    pub body_mode: String,
-    pub form_rows: Vec<KeyValueRow>,
-    pub multipart_rows: Vec<KeyValueRow>,
-    pub binary_file: String,
-    pub auth_type: String,
-    pub auth_fields: Value,
-    pub timeout_ms: u64,
-    pub follow_redirects: bool,
-    #[serde(default)]
-    pub favorite: bool,
-    #[serde(default)]
-    pub pre_request_script: String,
-    #[serde(default)]
-    pub post_response_script: String,
-    #[serde(default)]
-    pub scripts_enabled: bool,
-    #[serde(default)]
-    pub assertions: Vec<RequestAssertion>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestAssertion {
-    pub id: String,
-    pub kind: String,
-    pub operator: String,
-    pub target: String,
-    pub expected: String,
-    #[serde(default = "enabled")]
-    pub enabled: bool,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Collection {
-    pub id: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
-    #[serde(default)]
-    pub variables: Vec<Variable>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct Variable {
-    pub name: String,
-    pub value: String,
-    #[serde(default)]
-    pub secret: bool,
-    #[serde(default = "enabled")]
-    pub enabled: bool,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct Environment {
-    pub id: String,
-    pub name: String,
-    pub variables: Vec<Variable>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct HistoryEntry {
-    pub id: String,
-    pub request_id: Option<String>,
-    pub name: String,
-    pub method: String,
-    pub url: String,
-    pub status: Option<u16>,
-    pub elapsed_ms: Option<u128>,
-    pub created_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_snapshot: Option<SavedRequest>,
-}
-
-#[derive(Serialize)]
-pub struct WorkspaceSnapshot {
-    pub root: String,
-    pub portable: bool,
-    pub collections: Vec<Collection>,
-    pub requests: Vec<SavedRequest>,
-    pub environments: Vec<Environment>,
-    pub history: Vec<HistoryEntry>,
-    pub settings: WorkspaceSettings,
-    pub global_variables: Vec<Variable>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct DeletedCollectionSnapshot {
-    pub collections: Vec<Collection>,
-    pub requests: Vec<SavedRequest>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceSettings {
-    #[serde(default = "default_history_limit")]
-    pub history_limit: usize,
-    #[serde(default = "default_log_limit_mb")]
-    pub log_limit_mb: usize,
-    #[serde(default = "enabled")]
-    pub autosave: bool,
-}
-
-impl Default for WorkspaceSettings {
-    fn default() -> Self {
-        Self {
-            history_limit: default_history_limit(),
-            log_limit_mb: default_log_limit_mb(),
-            autosave: true,
-        }
-    }
-}
-
-fn default_history_limit() -> usize {
-    DEFAULT_HISTORY_LIMIT
-}
-fn default_log_limit_mb() -> usize {
-    DEFAULT_LOG_LIMIT_MB
-}
-
-#[derive(Serialize)]
-pub struct ImportResult {
-    pub message: String,
-    pub imported_requests: usize,
-    pub imported_environments: usize,
-}
-
-fn enabled() -> bool {
-    true
-}
 
 fn slug(value: &str) -> String {
     let result = value
@@ -544,80 +398,6 @@ pub fn add_history(app: &AppHandle, entry: &HistoryEntry) -> Result<(), String> 
         let _ = fs::remove_file(path);
     }
     Ok(())
-}
-
-fn enforce_log_limit(directory: &Path, limit_bytes: usize) -> Result<(), String> {
-    fs::create_dir_all(directory)
-        .map_err(|error| format!("Could not create log folder. ({error})"))?;
-    let mut files = fs::read_dir(directory)
-        .map_err(|error| format!("Could not read log folder. ({error})"))?
-        .flatten()
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            if !metadata.is_file() {
-                return None;
-            }
-            Some((
-                metadata.modified().unwrap_or(UNIX_EPOCH),
-                metadata.len() as usize,
-                entry.path(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    files.sort_by_key(|(modified, _, _)| *modified);
-
-    let mut total = files.iter().map(|(_, size, _)| size).sum::<usize>();
-    let remove_count = if limit_bytes == 0 {
-        files.len()
-    } else {
-        files.len().saturating_sub(1)
-    };
-    for (_, size, path) in files.iter().take(remove_count) {
-        if total <= limit_bytes {
-            break;
-        }
-        fs::remove_file(path)
-            .map_err(|error| format!("Could not remove old log file. ({error})"))?;
-        total = total.saturating_sub(*size);
-    }
-
-    if total > limit_bytes && limit_bytes > 0 {
-        if let Some((_, size, path)) = files.last() {
-            if path.exists() && *size > limit_bytes {
-                let bytes = fs::read(path)
-                    .map_err(|error| format!("Could not read active log file. ({error})"))?;
-                let tail = &bytes[bytes.len().saturating_sub(limit_bytes)..];
-                fs::write(path, tail)
-                    .map_err(|error| format!("Could not trim active log file. ({error})"))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn append_log(app: &AppHandle, event: &str) -> Result<(), String> {
-    let (root, _) = workspace_root(app)?;
-    ensure_workspace(&root)?;
-    let settings: WorkspaceSettings = read_json(&root.join("settings.json")).unwrap_or_default();
-    let limit_bytes = settings.log_limit_mb.saturating_mul(1024 * 1024);
-    if limit_bytes == 0 {
-        return enforce_log_limit(&root.join("logs"), 0);
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let path = root
-        .join("logs")
-        .join(format!("api-lantern-{}.log", now / 86_400));
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("Could not open log file. ({error})"))?;
-    writeln!(file, "{now} {}", event.replace(['\r', '\n'], " "))
-        .map_err(|error| format!("Could not write log file. ({error})"))?;
-    enforce_log_limit(&root.join("logs"), limit_bytes)
 }
 
 fn row(name: &str, value: &str) -> KeyValueRow {
@@ -1020,85 +800,6 @@ pub fn import_file(app: &AppHandle, path: &str) -> Result<ImportResult, String> 
         imported_requests: requests.len(),
         imported_environments: 0,
     })
-}
-
-fn add_directory_to_zip(
-    zip: &mut ZipWriter<fs::File>,
-    root: &Path,
-    directory: &Path,
-    prefix: &str,
-) -> Result<(), String> {
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        if path.starts_with(root.join("private")) {
-            continue;
-        }
-        if path.is_dir() {
-            add_directory_to_zip(zip, root, &path, prefix)?;
-        } else {
-            let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
-            let archive_path = Path::new(prefix)
-                .join(relative)
-                .to_string_lossy()
-                .replace('\\', "/");
-            zip.start_file(archive_path, options)
-                .map_err(|error| format!("Could not create ZIP entry. ({error})"))?;
-            let bytes = redact_export_bytes(
-                relative,
-                fs::read(&path).map_err(|error| error.to_string())?,
-            )?;
-            zip.write_all(&bytes).map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-fn redact_export_bytes(relative: &Path, mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    if relative.starts_with("environments") {
-        if let Ok(mut environment) = serde_json::from_slice::<Environment>(&bytes) {
-            for variable in &mut environment.variables {
-                if variable.secret {
-                    variable.value.clear();
-                }
-            }
-            bytes = serde_json::to_vec_pretty(&environment)
-                .map_err(|error| format!("Could not redact environment secrets. ({error})"))?;
-        }
-    } else if relative.starts_with("requests") {
-        if let Ok(mut request) = serde_json::from_slice::<SavedRequest>(&bytes) {
-            if let Some(fields) = request.auth_fields.as_object_mut() {
-                for key in ["password", "token", "value"] {
-                    if fields.contains_key(key) {
-                        fields.insert(key.into(), Value::String(String::new()));
-                    }
-                }
-            }
-            bytes = serde_json::to_vec_pretty(&request)
-                .map_err(|error| format!("Could not redact request secrets. ({error})"))?;
-        }
-    }
-    Ok(bytes)
-}
-
-pub fn export_portable(app: &AppHandle, path: &str) -> Result<(), String> {
-    let (root, _) = workspace_root(app)?;
-    ensure_workspace(&root)?;
-    let file = fs::File::create(path)
-        .map_err(|error| format!("Could not create portable workspace ZIP. ({error})"))?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    zip.start_file("README.txt", options)
-        .map_err(|error| error.to_string())?;
-    zip.write_all(b"API Lantern portable workspace\n\nPlace this workspace folder beside an API Lantern portable release. Secrets are intentionally excluded.\n")
-        .map_err(|error| error.to_string())?;
-    zip.start_file("portable.flag", options)
-        .map_err(|error| error.to_string())?;
-    add_directory_to_zip(&mut zip, &root, &root, "workspace")?;
-    zip.finish()
-        .map_err(|error| format!("Could not finish portable workspace ZIP. ({error})"))?;
-    Ok(())
 }
 
 #[cfg(test)]

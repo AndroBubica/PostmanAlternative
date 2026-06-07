@@ -1,9 +1,9 @@
-use api_lantern_lib::workspace::{
-    Collection, Environment, RequestAssertion, SavedRequest, Variable,
+use api_lantern_lib::runner::{
+    assertion_results, compare, json_path, junit as shared_junit, RunItem, RunReport, TestResult,
 };
+use api_lantern_lib::workspace::{Collection, Environment, SavedRequest, Variable};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::{header::HeaderName, multipart, Method, Url};
-use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -12,35 +12,6 @@ use std::{
     process::ExitCode,
     time::{Instant, SystemTime},
 };
-
-#[derive(Serialize)]
-struct TestResult {
-    name: String,
-    passed: bool,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct RunItem {
-    request_id: String,
-    name: String,
-    method: String,
-    url: String,
-    status: Option<u16>,
-    elapsed_ms: u128,
-    tests: Vec<TestResult>,
-    error: String,
-}
-
-#[derive(Serialize)]
-struct RunReport {
-    collection: String,
-    started_at: u64,
-    elapsed_ms: u128,
-    passed: usize,
-    failed: usize,
-    items: Vec<RunItem>,
-}
 
 struct Options {
     workspace: PathBuf,
@@ -145,116 +116,6 @@ fn descendants(collections: &[Collection], root: &str) -> HashSet<String> {
             return ids;
         }
     }
-}
-
-fn compare(assertion: &RequestAssertion, actual: Option<Value>) -> TestResult {
-    let actual_text = actual.as_ref().map(|value| match value {
-        Value::String(value) => value.clone(),
-        _ => value.to_string(),
-    });
-    let passed = match assertion.operator.as_str() {
-        "exists" => actual.is_some() && actual != Some(Value::Null),
-        "contains" => actual_text
-            .as_deref()
-            .unwrap_or("")
-            .contains(&assertion.expected),
-        "not-equals" => actual_text.as_deref().unwrap_or("") != assertion.expected,
-        "less-than" => {
-            actual_text
-                .as_deref()
-                .unwrap_or("")
-                .parse::<f64>()
-                .unwrap_or(f64::INFINITY)
-                < assertion
-                    .expected
-                    .parse::<f64>()
-                    .unwrap_or(f64::NEG_INFINITY)
-        }
-        _ => actual_text.as_deref().unwrap_or("") == assertion.expected,
-    };
-    TestResult {
-        name: format!("{} {}", assertion.kind, assertion.target),
-        passed,
-        message: if passed {
-            String::new()
-        } else {
-            format!(
-                "Expected {} {}, received {}",
-                assertion.operator,
-                assertion.expected,
-                actual_text.unwrap_or_else(|| "<missing>".into())
-            )
-        },
-    }
-}
-
-fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut current = value;
-    let mut token = String::new();
-    let mut chars = path
-        .trim_start_matches('$')
-        .trim_start_matches('.')
-        .chars()
-        .peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '.' => {
-                if !token.is_empty() {
-                    current = current.get(&token)?;
-                    token.clear();
-                }
-            }
-            '[' => {
-                if !token.is_empty() {
-                    current = current.get(&token)?;
-                    token.clear();
-                }
-                let mut index = String::new();
-                for character in chars.by_ref() {
-                    if character == ']' {
-                        break;
-                    }
-                    index.push(character);
-                }
-                current = current.get(index.parse::<usize>().ok()?)?;
-            }
-            _ => token.push(character),
-        }
-    }
-    if !token.is_empty() {
-        current = current.get(&token)?;
-    }
-    Some(current)
-}
-
-fn assertions(
-    items: &[RequestAssertion],
-    status: u16,
-    elapsed_ms: u128,
-    headers: &HashMap<String, String>,
-    body: &str,
-) -> Vec<TestResult> {
-    items
-        .iter()
-        .filter(|item| item.enabled)
-        .map(|item| {
-            let actual = match item.kind.as_str() {
-                "status" => Some(Value::from(status)),
-                "response-time" => Some(Value::from(elapsed_ms as u64)),
-                "body" => Some(Value::String(body.into())),
-                "header" => headers
-                    .get(&item.target.to_lowercase())
-                    .cloned()
-                    .map(Value::String),
-                "json-path" => {
-                    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-                    json_path(&parsed, &item.target).cloned()
-                }
-                _ => None,
-            };
-            compare(item, actual)
-        })
-        .collect()
 }
 
 async fn run_request(
@@ -464,7 +325,7 @@ async fn run_request(
         .collect::<HashMap<_, _>>();
     let body = response.text().await.map_err(|error| error.to_string())?;
     let elapsed_ms = started.elapsed().as_millis();
-    let mut tests = assertions(&request.assertions, status, elapsed_ms, &headers, &body);
+    let mut tests = assertion_results(&request.assertions, status, elapsed_ms, &headers, &body);
     if request.scripts_enabled
         && (!request.pre_request_script.trim().is_empty()
             || !request.post_response_script.trim().is_empty())
@@ -481,42 +342,6 @@ async fn run_request(
         tests,
         error: String::new(),
     })
-}
-
-fn junit(report: &RunReport) -> String {
-    let escape = |value: &str| {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-    };
-    let cases = report
-        .items
-        .iter()
-        .map(|item| {
-            let failure = if item.error.is_empty() {
-                item.tests
-                    .iter()
-                    .find(|test| !test.passed)
-                    .map(|test| test.message.clone())
-            } else {
-                Some(item.error.clone())
-            };
-            format!(
-                "  <testcase name=\"{}\" classname=\"{}\" time=\"{}\">{}</testcase>",
-                escape(&item.name),
-                escape(&report.collection),
-                item.elapsed_ms as f64 / 1000.0,
-                failure
-                    .map(|message| format!("<failure message=\"{}\"/>", escape(&message)))
-                    .unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" time=\"{}\">\n{}\n</testsuite>\n", escape(&report.collection), report.items.len(), report.failed, report.elapsed_ms as f64 / 1000.0, cases)
 }
 
 #[tokio::main]
@@ -607,7 +432,7 @@ async fn main() -> ExitCode {
         items,
     };
     let contents = if options.report == "junit" {
-        junit(&report)
+        shared_junit(&report)
     } else {
         serde_json::to_string_pretty(&report).unwrap()
     };
@@ -629,6 +454,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use api_lantern_lib::workspace::RequestAssertion;
 
     #[test]
     fn resolves_workspace_variables() {
@@ -699,7 +525,7 @@ mod tests {
                 error: "'failed'".into(),
             }],
         };
-        let xml = junit(&report);
+        let xml = shared_junit(&report);
         assert!(xml.contains("&amp;"));
         assert!(xml.contains("&quot;"));
         assert!(xml.contains("&lt;request&gt;"));

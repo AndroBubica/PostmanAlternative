@@ -87,6 +87,8 @@ description. See [WORKSPACE_FORMAT.md](WORKSPACE_FORMAT.md) for the standalone
 workspace contract. Release-device and accessibility verification procedures
 are documented in [PORTABLE_TEST_PLAN.md](PORTABLE_TEST_PLAN.md) and
 [ACCESSIBILITY_VERIFICATION.md](ACCESSIBILITY_VERIFICATION.md).
+Maintainers should also read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+[ARCHITECTURE_IMPROVEMENTS_PLAN.md](ARCHITECTURE_IMPROVEMENTS_PLAN.md).
 
 ## Portable Release Layout
 
