@@ -1,6 +1,6 @@
 [package]
 name = "api-lantern"
-version = "0.1.2"
+version = "0.2.0"
 description = "A free, local-first API client"
 authors = ["API Lantern contributors"]
 edition = "2021"

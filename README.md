@@ -20,23 +20,21 @@ Workspace data is stored in the operating system's local application-data
 folder. When `portable.flag` exists beside the application, all workspace data
 is stored in a `workspace` folder beside the portable release instead.
 
-## Phase 1 Release
+## Current Release
 
-API Lantern `v0.1.2` is the first published Phase 1 MVP release. It provides a
-local-first request editor and response viewer, nested collections, scoped
-variables, encrypted secrets, Postman/OpenAPI/cURL import, portable workspace
-storage, bounded history and logs, keyboard workflows, and accessible labels
-and focus behavior.
+API Lantern `v0.2.0` adds isolated pre-request and post-response JavaScript,
+friendly assertions, nested collection runs, JSON/JUnit reports, and a
+workspace CLI runner. It also includes substantial interface hardening and a
+more maintainable frontend and Rust architecture.
 
-The universal macOS package supports both Intel and Apple Silicon. Its
-published checksum and binary architectures have been independently verified:
+Portable Windows x64 and universal macOS packages are built automatically for
+the release:
 
-- [Download API Lantern v0.1.2](https://github.com/AndroBubica/PostmanAlternative/releases/tag/v0.1.2)
+- [Download API Lantern v0.2.0](https://github.com/AndroBubica/PostmanAlternative/releases/tag/v0.2.0)
 
-Phase 1 feature implementation is complete. Phase 1 verification and delivery
-remain open for:
+Release verification remains open for:
 
-- Windows x64 package publication, currently deferred.
+- Independent download and checksum verification of the published packages.
 - Physical USB-media portable-mode testing on Windows and macOS.
 - Hands-on keyboard, VoiceOver/NVDA, contrast, and zoom accessibility testing.
 
